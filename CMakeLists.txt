@@ -9,6 +9,7 @@ project(mylog CXX)
 
 # ------------------ 选项 ------------------
 option(MYLOG_BUILD_EXAMPLE "Build mylog example" ON)
+option(MYLOG_BUILD_TESTS "Build mylog tests" ON)
 
 # ------------------ 库 ------------------
 add_subdirectory(mylog)
@@ -17,5 +18,11 @@ add_subdirectory(mylog)
 if(MYLOG_BUILD_EXAMPLE)
     add_executable(mylog_example example.cpp)
     target_link_libraries(mylog_example PRIVATE mylog::mylog)
+endif()
+
+# ------------------ 测试 ------------------
+if(MYLOG_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
  
