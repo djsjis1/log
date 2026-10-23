@@ -6,6 +6,9 @@
 #include <vector>
 #include <chrono>
 #include <cstdio>
+#include <atomic>
+#include <sstream>
+#include <spdlog/sinks/ostream_sink.h>
 
 // ============================================================
 // 一、在任意函数中使用单例日志（无需传 logger）
@@ -178,8 +181,79 @@ void test_mt_async()
     LOGS_INFO("======= 单例-异步 完成, 总计 {} 条, 投递耗时 {} ms =======",
               kThreads * kPerThd, ms);
 
-    // 异步必须 shutdown 等后台写完
+    // 异步必须 shutdown 等后台写完；若关闭前已停止产生日志，
+    // 关闭自己的 flush 不会抢掉队列里已排队的日志。
     mylog::SingletonLogger::shutdown();
+}
+
+// ============================================================
+// 五、扩展能力：独立输出、回溯、定时刷新、自定义目标/格式与通知
+// 编译期裁剪可由使用方设置：
+// target_compile_definitions(your_target PRIVATE MYLOG_ACTIVE_LEVEL=MYLOG_LEVEL_INFO)
+// 默认保留全部调用；裁剪后的 Debug/Trace 不会进入回溯缓存。
+// ============================================================
+class DemoFormatter final : public spdlog::formatter
+{
+public:
+    void format(const spdlog::details::log_msg &msg, spdlog::memory_buf_t &dest) override
+    {
+        const std::string text = "[custom] " + std::string(msg.payload.data(), msg.payload.size()) + "\n";
+        dest.append(text.data(), text.data() + text.size());
+    }
+    std::unique_ptr<spdlog::formatter> clone() const override
+    {
+        return std::make_unique<DemoFormatter>();
+    }
+};
+
+static bool demo_extended_features()
+{
+    // 外部流必须比 logger 活得久；回调计数用原子量，因为这里启用了异步。
+    std::ostringstream captured;
+    std::atomic<int> notifications{0};
+    mylog::LogConfig cfg;
+    cfg.logger_name = "extended";
+    cfg.log_file = "extended.log";
+    cfg.rotation = mylog::LogConfig::RotationPolicy::None; // 也可选择 Hourly
+    cfg.level = mylog::Level::Info;
+    cfg.console_level = mylog::Level::Warn;
+    cfg.file_level = mylog::Level::Trace;
+    cfg.console_pattern = "[console] %v";
+    cfg.file_pattern = "[%Y-%m-%d %H:%M:%S] [%l] %v";
+    cfg.async = true;
+    cfg.backtrace_capacity = 2;
+    cfg.flush_interval = std::chrono::milliseconds(100);
+    cfg.log_callback = [&notifications](const mylog::LogEvent &event)
+    {
+        ++notifications;
+        std::fprintf(stderr, "[callback] %s: %s\n", event.logger_name.c_str(), event.message.c_str());
+        // 只做通知；不要在这里重入或直接关闭同一 logger。
+    };
+    mylog::SinkConfig memory;
+    memory.factory = [&captured]
+    {
+        return std::make_unique<spdlog::sinks::ostream_sink_mt>(captured);
+    };
+    cfg.extra_sinks.push_back(memory); // 非文件目标无需申报 file_paths
+
+    mylog::Logger logger(cfg);
+    if (!logger.is_initialized())
+    {
+        std::fprintf(stderr, "extended init failed: %s\n", logger.init_result().message.c_str());
+        return false;
+    }
+    logger.set_formatter(std::make_unique<DemoFormatter>());
+    // 最后一次设置生效：只恢复控制台和文件格式，内存目标继续使用自定义 formatter。
+    logger.set_console_pattern("[console] %v");
+    logger.set_file_pattern("[%Y-%m-%d %H:%M:%S] [%l] %v");
+    LOG_DEBUG(logger, "cached diagnostic: {}", 42); // 总门槛过滤，但仍进入回溯
+    LOG_INFO(logger, "visible in file and memory, not console");
+    logger.dump_backtrace(); // 控制台仍只接收 Warn 以上，文件可看到缓存的 Debug
+    LOG_ERROR(logger, "notification example");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    logger.shutdown(); // 停止定时器、等异步消费结束后，才能读取外部流
+    std::printf("\nCaptured logs:\n%sNotifications: %d\n", captured.str().c_str(), notifications.load());
+    return notifications.load() == 1;
 }
 
 // ============================================================
@@ -228,6 +302,7 @@ int main()
         cfg.enable_file = true;
         cfg.level = mylog::Level::Trace;
 
+        // 不关心失败原因时可以直接用 init()；需要区分原因用 init_checked()
         mylog::SingletonLogger::init(cfg);
 
         LOGS_TRACE("[单例] trace 日志");
@@ -240,6 +315,9 @@ int main()
         do_business_with_singleton(7);
         do_business_with_singleton(-1);
 
+        // shutdown() 只解除全局持有；若某线程还持有 acquire() 快照，
+        // 那段资源会到最后一个快照释放时才回收，期间同一日志文件仍被占用，
+        // 想用同一个文件重新 init() 需要等全部快照释放。
         mylog::SingletonLogger::shutdown();
     }
 
@@ -249,6 +327,8 @@ int main()
     test_mt_instance();
     test_mt_singleton();
     test_mt_async();
+    if (!demo_extended_features())
+        return 1;
 
     std::printf("\n==================== 全部测试完成 ====================\n");
     std::printf("日志文件位于 ./logs/ 目录下\n");
