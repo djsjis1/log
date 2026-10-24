@@ -1,7 +1,12 @@
 # Build directories
 build/
+build_*/
 out/
 cmake-build-*/
+
+# Logs produced by example/tests
+logs/
+mylog_test_logs/
 
 # Compiled objects
 *.o
@@ -12,6 +17,9 @@ cmake-build-*/
 *.so
 *.dylib
 *.a
+*.pdb
+*.ilk
+*.exp
 
 # CMake generated
 CMakeCache.txt
@@ -19,10 +27,12 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 compile_commands.json
+CMakeUserPresets.json
 
 # IDE
 .vs/
 .vscode/
+.qoder/
 *.swp
 *.swo
 

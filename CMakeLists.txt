@@ -2,8 +2,11 @@
 # 库本体（含 spdlog 依赖）位于 mylog/ 子目录，可整个拷贝到其他项目：
 #   add_subdirectory(path/to/mylog)
 #   target_link_libraries(your_target PRIVATE mylog::mylog)
+#
+# 版本必须与 mylog/CMakeLists.txt 一致：子目录要求 3.21，顶层声明更低版本时
+# 3.11~3.20 的 CMake 会在这里配置失败。
 
-cmake_minimum_required(VERSION 3.11)
+cmake_minimum_required(VERSION 3.21)
 
 project(mylog CXX)
 
@@ -18,6 +21,11 @@ add_subdirectory(mylog)
 if(MYLOG_BUILD_EXAMPLE)
     add_executable(mylog_example example.cpp)
     target_link_libraries(mylog_example PRIVATE mylog::mylog)
+    if(MSVC)
+        target_compile_options(mylog_example PRIVATE /utf-8 /W4)
+    else()
+        target_compile_options(mylog_example PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 # ------------------ 测试 ------------------
@@ -25,4 +33,3 @@ if(MYLOG_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
- 

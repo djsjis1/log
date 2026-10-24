@@ -1,13 +1,17 @@
 // Logger.cpp
 #include "Logger.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cctype>
 #include <cstdint>
 #include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -15,7 +19,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "spdlog/spdlog.h"
+
 #include "spdlog/async.h"
+#include "spdlog/details/periodic_worker.h"
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/daily_file_sink.h"
 #include "spdlog/sinks/hourly_file_sink.h"
@@ -49,41 +56,13 @@ namespace mylog
             case Level::Off:
                 return spdlog::level::off;
             }
-            return spdlog::level::info;
-        }
-
-        Level from_spdlog_level(spdlog::level::level_enum lvl)
-        {
-            switch (lvl)
-            {
-            case spdlog::level::trace:
-                return Level::Trace;
-            case spdlog::level::debug:
-                return Level::Debug;
-            case spdlog::level::info:
-                return Level::Info;
-            case spdlog::level::warn:
-                return Level::Warn;
-            case spdlog::level::err:
-                return Level::Error;
-            case spdlog::level::critical:
-                return Level::Critical;
-            case spdlog::level::off:
-                return Level::Off;
-            default:
-                break;
-            }
-            return Level::Off;
+            // 非法枚举值（调用方 static_cast 出来时）一律关闭，绝不悄悄变成 info。
+            return spdlog::level::off;
         }
 
     } // namespace detail
 
     // ---------------------- Logger ----------------------
-
-    namespace
-    {
-        class PeriodicFlusher;
-    }
 
     // 实例的全部可变状态都放在堆上：地址稳定，因此移动 Logger、
     // 以及在错误回调里保存指针都不会悬空。
@@ -96,8 +75,13 @@ namespace mylog
         spdlog::sink_ptr file_sink;
         std::string name;
         InitResult init;
-        // 最后声明，异常回收时也先停止定时器，再释放它访问的资源。
-        std::unique_ptr<PeriodicFlusher> flusher;
+        // 关闭时做最后刷新失败时仍要通知用户，所以留着这份副本。
+        std::function<void(const std::string &)> error_handler;
+        // 名字是否仍在 spdlog registry 里：关闭时用它做幂等注销，
+        // 因此不必把 name 清空（name() 在关闭后仍应保持稳定）。
+        bool registered = false;
+        // 定时刷新登记令牌：最后声明，回收时先注销它，保证调度线程不再触碰本实例。
+        std::shared_ptr<void> flush_token;
     };
 
     namespace
@@ -105,6 +89,12 @@ namespace mylog
         // 记录当前线程属于哪个 Logger 实例的异步线程池
         thread_local const void *t_worker_state = nullptr;
         thread_local const void *t_timer_state = nullptr;
+
+        // 回溯导出串行化锁：spdlog 的 dump 会在持有本实例回溯锁的情况下
+        // 调用所有目标（含用户回调），两个实例同时导出、回调又互相写日志时，
+        // 会各自等待对方的回溯锁。串行化后同一时刻只有一个导出在执行。
+        // 用递归锁，允许回调里再导出另一个实例（同一线程持有，不会互等）。
+        std::recursive_mutex g_backtrace_dump_mutex;
 
         // 用栈上链表记录整条嵌套回调链，A -> B -> A 也能识别，无额外分配。
         class CallbackScope;
@@ -127,49 +117,160 @@ namespace mylog
             const CallbackScope *previous_;
         };
 
-        // 构造后先休眠，初始化完全成功才启动；等待与执行回调不共用持锁区间。
-        class PeriodicFlusher
+        // 回收线程（定义在本文件后部）：这里只用来把"不能在本线程做的收尾"转交出去。
+        void defer_destroy(std::shared_ptr<spdlog::details::periodic_worker> worker);
+
+        // ---- 定时刷新调度 ----
+        // 全进程共用一个 spdlog::details::periodic_worker 线程：实例只在启动时登记
+        // 一个回调、关闭时注销。没人配置 flush_interval 时线程根本不存在。
+        // 相同间隔共用一个桶，不同间隔各一个桶（实际几乎只有一种间隔）。
+        class FlushScheduler
         {
         public:
-            PeriodicFlusher(std::chrono::milliseconds interval, std::function<void()> work)
-                : thread_([this, interval, work = std::move(work)]
-                {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    cv_.wait(lock, [this] { return started_ || stopped_; });
-                    while (!stopped_)
-                    {
-                        if (cv_.wait_for(lock, interval, [this] { return stopped_; }))
-                            break;
-                        lock.unlock();
-                        work();
-                        lock.lock();
-                    }
-                }) {}
-            ~PeriodicFlusher()
+            // 登记定时刷新；返回的令牌析构即注销。interval<=0 或 work 为空时返回空令牌。
+            std::shared_ptr<void> add(std::chrono::milliseconds interval, std::function<void()> work)
             {
+                if (interval.count() <= 0 || !work)
+                    return {};
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                Slot &slot = slots_[interval];
+                if (!slot.bucket)
                 {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    stopped_ = true;
+                    slot.bucket = std::make_shared<Bucket>();
+                    auto bucket = slot.bucket;
+                    // periodic_worker 构造即起线程；同类实例共享它。
+                    slot.worker = std::make_unique<spdlog::details::periodic_worker>(
+                        [bucket] { tick(bucket); }, interval);
                 }
-                cv_.notify_all();
-                if (thread_.joinable())
-                    thread_.join();
+
+                const std::size_t id = next_id_++;
+                {
+                    std::lock_guard<std::mutex> bucket_lock(slot.bucket->mutex);
+                    // 写时复制：tick 只需拷一个指针，锁内不做任何分配/深拷。
+                    auto next = std::make_shared<std::vector<Entry>>();
+                    if (slot.bucket->entries)
+                        *next = *slot.bucket->entries;
+                    next->push_back(Entry{id, std::move(work)});
+                    slot.bucket->entries = std::move(next);
+                }
+
+                // 令牌的析构函数就是注销动作；调度器本身故意不析构，this 永远有效。
+                FlushScheduler *self = this;
+                return std::shared_ptr<void>(nullptr,
+                                             [self, interval, id](void *) { self->remove(interval, id); });
             }
-            void start()
+
+            static FlushScheduler &instance()
             {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    started_ = true;
-                }
-                cv_.notify_all();
+                // 同 Reaper：故意不析构，避免与静态析构顺序纠缠。
+                static FlushScheduler *scheduler = new FlushScheduler();
+                return *scheduler;
             }
+
         private:
+            struct Entry
+            {
+                std::size_t id;
+                std::function<void()> work;
+            };
+
+            struct Bucket
+            {
+                std::mutex mutex;
+                std::condition_variable cv;
+                // 名单不可变，改一份就整体换：tick 锁内只拷指针，锁外慢慢跑。
+                std::shared_ptr<const std::vector<Entry>> entries;
+                int running = 0; // 正在执行的 tick 数（0 或 1），注销时要等它归零
+            };
+
+            struct Slot
+            {
+                std::shared_ptr<Bucket> bucket;
+                std::unique_ptr<spdlog::details::periodic_worker> worker;
+            };
+
+            // 回调在锁外执行：work 里可能重入注销/用户回调，持锁调用会死锁。
+            static void tick(const std::shared_ptr<Bucket> &bucket)
+            {
+                std::shared_ptr<const std::vector<Entry>> snapshot;
+                {
+                    std::lock_guard<std::mutex> lock(bucket->mutex);
+                    if (!bucket->entries || bucket->entries->empty())
+                        return;
+                    ++bucket->running;
+                    snapshot = bucket->entries; // 只拷指针，零深拷贝
+                }
+
+                for (const auto &entry : *snapshot)
+                    entry.work();
+
+                {
+                    std::lock_guard<std::mutex> lock(bucket->mutex);
+                    --bucket->running;
+                }
+                bucket->cv.notify_all();
+            }
+
+            void remove(std::chrono::milliseconds interval, std::size_t id)
+            {
+                std::unique_ptr<spdlog::details::periodic_worker> dying;
+                std::shared_ptr<Bucket> bucket;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    auto it = slots_.find(interval);
+                    if (it == slots_.end())
+                        return;
+
+                    bucket = it->second.bucket;
+                    bool empty = false;
+                    {
+                        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+                        if (!bucket->entries)
+                            return;
+                        auto next = std::make_shared<std::vector<Entry>>();
+                        next->reserve(bucket->entries->size());
+                        for (const auto &entry : *bucket->entries)
+                            if (entry.id != id)
+                                next->push_back(entry);
+                        empty = next->empty();
+                        bucket->entries = std::move(next);
+                    }
+                    if (!empty)
+                        return;
+
+                    // 最后一个登记项走了：把这个桶的 worker 摘下来，
+                    // 等本轮 tick 结束再在锁外销毁（join）。
+                    dying = std::move(it->second.worker);
+                    slots_.erase(it);
+                }
+
+                {
+                    std::unique_lock<std::mutex> bucket_lock(bucket->mutex);
+                    bucket->cv.wait(bucket_lock, [&bucket] { return bucket->running == 0; });
+                }
+
+                if (!dying)
+                    return;
+
+                // 在调度线程自己身上 join 会终止进程：交给回收线程收尾。
+                if (t_timer_state != nullptr)
+                {
+                    defer_destroy(std::shared_ptr<spdlog::details::periodic_worker>(std::move(dying)));
+                    return;
+                }
+                dying.reset();
+            }
+
             std::mutex mutex_;
-            std::condition_variable cv_;
-            bool started_ = false;
-            bool stopped_ = false;
-            std::thread thread_;
+            std::map<std::chrono::milliseconds, Slot> slots_;
+            std::size_t next_id_ = 0;
         };
+
+        FlushScheduler &flush_scheduler()
+        {
+            return FlushScheduler::instance();
+        }
 
         void report_error(const std::function<void(const std::string &)> &handler,
                           const std::string &msg)
@@ -196,6 +297,30 @@ namespace mylog
         }
 
         // 用户回调没有 sink 锁；多线程可同时通知，用户负责其共享数据同步。
+        Level from_spdlog_level(spdlog::level::level_enum lvl)
+        {
+            switch (lvl)
+            {
+            case spdlog::level::trace:
+                return Level::Trace;
+            case spdlog::level::debug:
+                return Level::Debug;
+            case spdlog::level::info:
+                return Level::Info;
+            case spdlog::level::warn:
+                return Level::Warn;
+            case spdlog::level::err:
+                return Level::Error;
+            case spdlog::level::critical:
+                return Level::Critical;
+            case spdlog::level::off:
+                return Level::Off;
+            default:
+                break;
+            }
+            return Level::Off;
+        }
+
         class EventSink final : public spdlog::sinks::sink
         {
         public:
@@ -209,7 +334,7 @@ namespace mylog
                 CallbackScope scope(state_);
                 try
                 {
-                    LogEvent event{detail::from_spdlog_level(msg.level),
+                    LogEvent event{from_spdlog_level(msg.level),
                                    std::string(msg.logger_name.data(), msg.logger_name.size()),
                                    std::string(msg.payload.data(), msg.payload.size())};
                     callback_(event);
@@ -368,9 +493,183 @@ namespace mylog
             return level >= Level::Trace && level <= Level::Off;
         }
 
+        // ---- 日志器回收 ----
+        // 最后一个快照可能在后台线程（异步消费、定时刷新）或用户回调里释放：
+        // 在那里直接 delete 会 join 自己，detach 一个线程又会让进程退出期与
+        // spdlog 的静态对象析构相互穿插，而且 shutdown() 返回时资源还没真正归还。
+        // 因此改为常驻一个回收线程，shutdown()/init() 末了等队列排空。
+        thread_local bool t_on_reaper = false;
+
+        class Reaper
+        {
+        public:
+            Reaper()
+                : worker_([this]
+                          {
+                              t_on_reaper = true;
+                              for (;;)
+                              {
+                                  Logger *logger = nullptr;
+                                  std::function<void()> task;
+                                  {
+                                      std::unique_lock<std::mutex> lock(mutex_);
+                                      cv_.wait(lock, [this] { return !pending_.empty() || !tasks_.empty(); });
+                                      busy_ = true;
+                                      if (!tasks_.empty())
+                                      {
+                                          task = std::move(tasks_.front());
+                                          tasks_.pop_front();
+                                      }
+                                      else
+                                      {
+                                          logger = pending_.front();
+                                          pending_.pop_front();
+                                      }
+                                  }
+                                  if (task)
+                                      task();
+                                  else
+                                      delete logger;
+                                  {
+                                      std::lock_guard<std::mutex> lock(mutex_);
+                                      busy_ = false;
+                                  }
+                                  idle_cv_.notify_all();
+                              }
+                          })
+            {
+            }
+
+            void enqueue(Logger *logger)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    pending_.push_back(logger);
+                }
+                cv_.notify_one();
+            }
+
+            // 通用任务队列：用于“当前线程不能做”的收尾（如在调度线程上 join 自己）。
+            void enqueue_task(std::function<void()> task)
+            {
+                if (!task)
+                    return;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    tasks_.push_back(std::move(task));
+                }
+                cv_.notify_one();
+            }
+
+            // 等待已转交的实例与任务全部完成。回收线程自身或任何一个日志器的后台线程
+            // 上调用时直接返回：等下去等于等自己。
+            void drain()
+            {
+                if (t_on_reaper || t_worker_state || t_timer_state)
+                    return;
+                std::unique_lock<std::mutex> lock(mutex_);
+                idle_cv_.wait(lock, [this] { return pending_.empty() && tasks_.empty() && !busy_; });
+            }
+
+        private:
+            std::mutex mutex_;
+            std::condition_variable cv_;
+            std::condition_variable idle_cv_;
+            std::deque<Logger *> pending_;
+            std::deque<std::function<void()>> tasks_;
+            bool busy_ = false;
+            std::thread worker_;
+        };
+
+        std::atomic<Reaper *> g_reaper{nullptr};
+
+        Reaper &reaper_instance()
+        {
+            // 故意不析构：回收线程在进程退出阶段仍可能持有待销毁对象，
+            // 让它随进程结束由系统回收，避免与静态析构顺序纠缠。
+            static Reaper *instance = []
+            {
+                auto *created = new Reaper();
+                g_reaper.store(created, std::memory_order_release);
+                return created;
+            }();
+            return *instance;
+        }
+
+        // 定义在 Reaper 之后：把当前线程不能做的 join 转交给回收线程。
+        void defer_destroy(std::shared_ptr<spdlog::details::periodic_worker> worker)
+        {
+            if (!worker)
+                return;
+            reaper_instance().enqueue_task([worker]() mutable { worker.reset(); });
+        }
+
+        // 退出前清空转交队列；声明位置早于 g_singleton，因此析构晚于它。
+        struct ReaperGuard
+        {
+            ~ReaperGuard()
+            {
+                // 只在回收线程确实启动过时才等待，避免在静态析构阶段新建线程。
+                if (auto *reaper = g_reaper.load(std::memory_order_acquire))
+                    reaper->drain();
+            }
+        };
+
     } // namespace
 
+    // 把内部日志器登记到 spdlog registry。同名旧项先摘掉：单例替换旧实例时
+    // 这是预期行为，普通实例在构造时已确认过没有同名冲突。
+    // 单例场景下必须与“全局指针交换”处于同一临界区（g_singleton_mutex）。
+    void Logger::attach_registry()
+    {
+        State &st = *state_;
+        if (!st.logger || st.name.empty())
+            return;
+        spdlog::drop(st.name);
+        spdlog::register_logger(st.logger);
+        st.registered = true;
+    }
+
+    // 普通实例的构造：先按 DeferRegister 完成全部资源初始化，再检查名字冲突并注册。
+    // 同名已被占用时明确失败，不再静默把别人的注册顶掉（旧实现直接 spdlog::drop）。
     Logger::Logger(const LogConfig &cfg)
+        : Logger(cfg, DeferRegister{})
+    {
+        State &st = *state_;
+        if (!st.init.ok)
+            return; // 构造阶段已经失败并上报过
+
+        std::string failure;
+        try
+        {
+            if (spdlog::get(st.name) != nullptr)
+                failure = "[mylog] logger name '" + st.name + "' is already registered";
+            else
+                attach_registry();
+        }
+        catch (const std::exception &ex)
+        {
+            failure = std::string("[mylog] cannot register logger name '") + st.name + "': " + ex.what();
+        }
+
+        if (failure.empty())
+            return;
+
+        // 回滚：先释放日志器（它持有 sink 的强引用），再放掉 sink 自己的那份，
+        // 线程池也要停，否则这个“不可用”的实例会白白养着一批消费线程。
+        st.flush_token.reset();
+        st.logger.reset();
+        st.pool.reset();
+        st.console_sink.reset();
+        st.file_sink.reset();
+        st.init.ok = false;
+        st.init.degraded = false;
+        st.init.error = InitError::InvalidConfig;
+        st.init.message = failure;
+        report_error(st.error_handler, failure);
+    }
+
+    Logger::Logger(const LogConfig &cfg, DeferRegister)
         : state_(std::make_unique<State>())
     {
         State &st = *state_;
@@ -383,6 +682,8 @@ namespace mylog
             st.init.message = msg;
             report_error(handler, msg);
         };
+
+        st.error_handler = cfg.error_handler;
 
         // ---------- 1. 配置校验（先于任何资源申请） ----------
         if (cfg.logger_name.empty())
@@ -710,43 +1011,15 @@ namespace mylog
                 });
             }
 
-            if (cfg.flush_interval.count() > 0)
-            {
-                State *state_ptr = &st;
-                st.flusher = std::make_unique<PeriodicFlusher>(cfg.flush_interval,
-                    [state_ptr, guarded = handler]
-                    {
-                        t_timer_state = state_ptr;
-                        try
-                        {
-                            if (state_ptr->pool)
-                            {
-                                auto async = std::static_pointer_cast<spdlog::async_logger>(state_ptr->logger);
-                                state_ptr->pool->post_flush(std::move(async), spdlog::async_overflow_policy::block);
-                            }
-                            else
-                                state_ptr->logger->flush();
-                        }
-                        catch (...)
-                        {
-                            CallbackScope scope(state_ptr);
-                            report_error(guarded, "[mylog] periodic flush failed");
-                        }
-                        t_timer_state = nullptr;
-                    });
-            }
-
-            // 同名旧实例先从 registry 摘掉；旧实例对象本身仍由持有者管理，
-            // 其 shutdown 会用 get() 比对，不会误删新注册的同名 logger。
+            // 名字只做记录：真正登记到 spdlog registry 由 attach_registry()
+            // 在调用方指定的临界区里完成（单例必须与全局指针交换原子）。
             st.name = cfg.logger_name;
-            spdlog::drop(cfg.logger_name);
-            spdlog::register_logger(st.logger);
             st.console_sink = std::move(console_sink);
             st.file_sink = std::move(primary_sink);
         }
         catch (const std::exception &ex)
         {
-            st.flusher.reset();
+            st.flush_token.reset();
             st.logger.reset();
             st.pool.reset();
             fail(InitError::Unknown, std::string("[mylog] init failed: ") + ex.what());
@@ -755,17 +1028,36 @@ namespace mylog
 
         st.init.ok = true;
         st.init.error = InitError::None;
-        if (st.flusher)
-            st.flusher->start();
-    }
 
-    // 空状态：不创建 sink、不注册名称、不创建线程池，
-    // 所有写日志与设置操作都会因为 impl() 为空而自然变成无副作用操作。
-    Logger::Logger(NullTag)
-        : state_(std::make_unique<State>())
-    {
-        state_->init.ok = false;
-        state_->init.error = InitError::None;
+        // 定时刷新：登记到进程内共享调度器（全进程一个 periodic_worker 线程）。
+        // 注册放在“初始化完全成功”之后，保证第一次 tick 不会碰到半成品。
+        if (cfg.flush_interval.count() > 0)
+        {
+            State *state_ptr = &st;
+            st.flush_token = flush_scheduler().add(cfg.flush_interval,
+                [state_ptr, guarded = st.error_handler]
+                {
+                    t_timer_state = state_ptr;
+                    try
+                    {
+                        if (state_ptr->pool)
+                        {
+                            auto async = std::static_pointer_cast<spdlog::async_logger>(state_ptr->logger);
+                            state_ptr->pool->post_flush(std::move(async), spdlog::async_overflow_policy::block);
+                        }
+                        else
+                        {
+                            state_ptr->logger->flush();
+                        }
+                    }
+                    catch (...)
+                    {
+                        CallbackScope scope(state_ptr);
+                        report_error(guarded, "[mylog] periodic flush failed");
+                    }
+                    t_timer_state = nullptr;
+                });
+        }
     }
 
     Logger::Logger(Logger &&other) noexcept
@@ -775,13 +1067,20 @@ namespace mylog
 
     Logger &Logger::operator=(Logger &&other) noexcept
     {
-        if (this != &other)
+        if (this == &other)
+            return *this;
+
+        // 在目标自己的回调或后台线程上销毁它，会直接截断正在执行的调用栈，
+        // 所以这种场合只能放弃这次移交；Debug 下立即暴露出来。
+        if (!can_operate() || !other.can_operate() ||
+            is_on_background_thread() || other.is_on_background_thread())
         {
-            if (!can_operate() || !other.can_operate() || is_on_background_thread() || other.is_on_background_thread())
-                return *this;
-            release();
-            state_ = std::move(other.state_);
+            assert(false && "[mylog] move assignment ignored inside a callback or background thread");
+            return *this;
         }
+
+        release();
+        state_ = std::move(other.state_);
         return *this;
     }
 
@@ -789,10 +1088,10 @@ namespace mylog
     {
         if (is_on_background_thread() || !can_operate())
         {
-            // 在自身后台线程上析构时不能等待线程池退出（会 join 自身），
-            // 只能把状态泄漏出去，优先保证进程不崩溃。
-            std::fprintf(stderr, "[mylog] Logger destroyed on its own background thread or callback; "
-                                 "resources are leaked to avoid joining itself\n");
+            // 在自身后台线程上析构不能等线程池退出（会 join 自身），在回调里析构
+            // 会拆掉正在使用的目标；两种情况都只能泄漏状态，优先保证进程不崩。
+            std::fprintf(stderr, "[mylog] Logger destroyed on its own background thread or inside its own callback; "
+                                 "resources are leaked to avoid destroying it while in use\n");
             (void)state_.release();
             return;
         }
@@ -816,27 +1115,15 @@ namespace mylog
         if (!st)
             return;
 
-        st->flusher.reset();
-        if (st->logger)
-        {
-            try
-            {
-                // 异步实例的 flush 本身就是一条队列消息，会沿用该实例的溢出策略。
-                // 关闭是控制动作，必须阻塞入队，否则 OverrunOldest 下会挤掉
-                // 队列里尚未写出的用户日志（生产者此时已停止，属于额外丢失）。
-                auto async = st->pool ? std::dynamic_pointer_cast<spdlog::async_logger>(st->logger)
-                                      : nullptr;
-                if (async)
-                    st->pool->post_flush(std::move(async), spdlog::async_overflow_policy::block);
-                else
-                    st->logger->flush();
-            }
-            catch (...)
-            {
-            }
-        }
+        // 先注销定时刷新：调度线程不会再触碰本实例。
+        st->flush_token.reset();
 
-        if (!st->name.empty())
+        // 目标可能在销毁 logger 时一起释放，先留一份持有，供最后刷新使用。
+        std::vector<spdlog::sink_ptr> sinks;
+        if (st->logger)
+            sinks = st->logger->sinks();
+
+        if (st->registered)
         {
             try
             {
@@ -849,20 +1136,43 @@ namespace mylog
             catch (...)
             {
             }
-            st->name.clear();
+            // 名字保留：name() 在关闭后仍应返回构造时的名字。
+            st->registered = false;
         }
 
-        // 先释放 logger（可能还在向 pool 投递），再释放线程池
+        // 先释放 logger，再销毁线程池：异步池的析构会先给每个消费线程发终止消息
+        // 再 join，队列是先进先出的，所以这里返回时已入队的日志都写进了目标。
         st->logger.reset();
         st->pool.reset();
+
+        // 多消费线程时，先执行到的 flush 可能早于最后一条写入（消费线程已从队列
+        // 取出日志但还没写进目标）。写入全部结束后由当前线程再同步刷新一次，
+        // 保证最后一个目标也真的被刷出，而不是只剩一个排队中的刷新请求。
+        for (auto &sink : sinks)
+        {
+            try
+            {
+                sink->flush();
+            }
+            catch (const std::exception &ex)
+            {
+                report_error(st->error_handler, std::string("[mylog] final flush failed: ") + ex.what());
+            }
+            catch (...)
+            {
+                report_error(st->error_handler, "[mylog] final flush failed: unknown exception");
+            }
+        }
+
         st->console_sink.reset();
         st->file_sink.reset();
+        // 关闭后对外就是"未初始化的空实例"：不保留上一次初始化/降级的说明，
+        // 也不再把用户回调及其捕获的资源拖着不放。
+        st->error_handler = nullptr;
         st->init.ok = false;
-    }
-
-    bool Logger::is_on_worker_thread() const noexcept
-    {
-        return state_ && t_worker_state == state_.get();
+        st->init.degraded = false;
+        st->init.error = InitError::None;
+        st->init.message.clear();
     }
 
     bool Logger::is_on_background_thread() const noexcept
@@ -901,6 +1211,12 @@ namespace mylog
     {
         if (!can_operate())
             return;
+        if (!valid_level(lvl))
+        {
+            if (state_)
+                report_error(state_->error_handler, "[mylog] set_level: invalid level");
+            return;
+        }
         if (auto *target = impl())
             target->set_level(detail::to_spdlog_level(lvl));
     }
@@ -909,6 +1225,12 @@ namespace mylog
     {
         if (!can_operate())
             return;
+        if (!valid_level(lvl))
+        {
+            if (state_)
+                report_error(state_->error_handler, "[mylog] set_flush_level: invalid level");
+            return;
+        }
         if (auto *target = impl())
             target->flush_on(detail::to_spdlog_level(lvl));
     }
@@ -923,22 +1245,105 @@ namespace mylog
 
     void Logger::flush()
     {
-        if (!can_operate())
+        if (!can_operate() || !state_)
             return;
+
+        // 异步实例用 block 策略投递刷新请求：spdlog 默认按本实例的溢出策略入队，
+        // OverrunOldest / DiscardNew 下这条控制消息会把真正排队的日志挤掉。
+        if (auto async = std::dynamic_pointer_cast<spdlog::async_logger>(state_->logger))
+        {
+            if (!state_->pool)
+                return;
+            try
+            {
+                state_->pool->post_flush(std::move(async), spdlog::async_overflow_policy::block);
+            }
+            catch (const std::exception &ex)
+            {
+                report_error(state_->error_handler, std::string("[mylog] flush failed: ") + ex.what());
+            }
+            return;
+        }
+
         if (auto *target = impl())
             target->flush();
     }
 
+    bool Logger::flush_and_wait(std::chrono::milliseconds timeout)
+    {
+        if (!can_operate() || !state_ || !state_->logger)
+            return false;
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        auto wait_drained = [&deadline](spdlog::details::thread_pool *pool)
+        {
+            while (pool->queue_size() != 0)
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return true;
+        };
+
+        if (auto *pool = state_->pool.get())
+        {
+            if (!wait_drained(pool))
+                return false;
+
+            // 队列已空时再投一次刷新：不会因队列满而阻塞，也不会挤掉任何日志。
+            try
+            {
+                auto async = std::static_pointer_cast<spdlog::async_logger>(state_->logger);
+                pool->post_flush(std::move(async), spdlog::async_overflow_policy::block);
+            }
+            catch (...)
+            {
+                return false;
+            }
+            if (!wait_drained(pool))
+                return false;
+        }
+
+        // 最后由调用线程把每个目标同步刷一遍：这一步是把文件缓冲真正推到磁盘上。
+        auto sinks = state_->logger->sinks();
+        bool ok = true;
+        for (auto &sink : sinks)
+        {
+            try
+            {
+                sink->flush();
+            }
+            catch (...)
+            {
+                ok = false;
+            }
+        }
+        return ok;
+    }
+
     void Logger::set_console_level(Level lvl)
     {
-        if (can_operate() && state_ && state_->console_sink)
-            state_->console_sink->set_level(detail::to_spdlog_level(lvl));
+        if (!can_operate() || !state_ || !state_->console_sink)
+            return;
+        if (!valid_level(lvl))
+        {
+            report_error(state_->error_handler, "[mylog] set_console_level: invalid level");
+            return;
+        }
+        state_->console_sink->set_level(detail::to_spdlog_level(lvl));
     }
 
     void Logger::set_file_level(Level lvl)
     {
-        if (can_operate() && state_ && state_->file_sink)
-            state_->file_sink->set_level(detail::to_spdlog_level(lvl));
+        if (!can_operate() || !state_ || !state_->file_sink)
+            return;
+        if (!valid_level(lvl))
+        {
+            report_error(state_->error_handler, "[mylog] set_file_level: invalid level");
+            return;
+        }
+        state_->file_sink->set_level(detail::to_spdlog_level(lvl));
     }
 
     void Logger::set_console_pattern(const std::string &pattern)
@@ -980,9 +1385,14 @@ namespace mylog
 
     void Logger::dump_backtrace()
     {
-        if (can_operate())
-            if (auto *target = impl())
-                target->dump_backtrace();
+        if (!can_operate())
+            return;
+        auto *target = impl();
+        if (!target)
+            return;
+        // 导出期间 spdlog 持有本实例的回溯锁；串行化导出避免与其他实例的导出互等。
+        std::lock_guard<std::recursive_mutex> lock(g_backtrace_dump_mutex);
+        target->dump_backtrace();
     }
 
     bool Logger::should_log(Level lvl) const
@@ -991,10 +1401,25 @@ namespace mylog
         return target && target->should_log(detail::to_spdlog_level(lvl));
     }
 
+    bool Logger::should_process(Level lvl) const
+    {
+        auto *target = impl();
+        if (!target)
+            return false;
+        // 回溯缓存开启时，低于门槛的日志也要走到 logger::log() 才会被存进环形缓冲，
+        // 否则 dump_backtrace() 永远只能看到高于门槛的那几条。
+        return target->should_log(detail::to_spdlog_level(lvl)) || target->should_backtrace();
+    }
+
     Level Logger::level() const
     {
         auto *target = impl();
-        return target ? detail::from_spdlog_level(target->level()) : Level::Off;
+        return target ? from_spdlog_level(target->level()) : Level::Off;
+    }
+
+    std::shared_ptr<spdlog::logger> Logger::native() const
+    {
+        return state_ ? state_->logger : nullptr;
     }
 
     AsyncStats Logger::stats() const
@@ -1021,63 +1446,129 @@ namespace mylog
 
     namespace
     {
+        // 声明在 g_singleton 之前：析构更晚，保证退出时先排空转交队列。
+        ReaperGuard g_reaper_guard;
+
         // 用原子读写代替全局锁：日志热路径不再争抢同一把互斥量，
         // 同时保证 acquire() 拿到的 shared_ptr 快照是完整的。
         std::shared_ptr<Logger> g_singleton;
-        std::mutex g_singleton_mutex; // 只用于串行化 init()/shutdown() 的交换动作
+        std::mutex g_singleton_mutex; // 串行化"换指针 + 登记名字"
+
+        // 代际号：每次换/清空全局指针时 +1，用来让线程本地缓存失效。
+        // 必须先换指针再 +1（同一临界区内），否则读者可能把旧指针配上新代际号。
+        std::atomic<std::uint64_t> g_generation{0};
+
+        // 线程本地缓存：只存 weak_ptr，不延长任何寿命。
+        // 因此 shutdown() 仍能在最后一个快照释放后立刻回收文件占用；
+        // 快路径只是省掉一次全局的 shared_ptr 原子加载。
+        thread_local std::weak_ptr<Logger> t_cached_singleton;
+        thread_local std::uint64_t t_cached_generation = ~std::uint64_t{0};
+
+        // init() 期间用户回调再调 init/shutdown 会重复获取 g_singleton_mutex，
+        // 直接判为非法调用（返回失败），而不是挂住。
+        thread_local bool t_in_singleton_control = false;
+
+        struct ControlScope
+        {
+            ControlScope() noexcept : previous_(t_in_singleton_control) { t_in_singleton_control = true; }
+            ~ControlScope() { t_in_singleton_control = previous_; }
+            ControlScope(const ControlScope &) = delete;
+            ControlScope &operator=(const ControlScope &) = delete;
+
+        private:
+            bool previous_;
+        };
     } // namespace
 
-    std::shared_ptr<Logger> SingletonLogger::acquire()
+    // 直接销毁还是转交回收线程，取决于"当前线程能不能等"：
+    // 后台线程 join 自己会死锁，回调里销毁正在使用的目标也是 UB。
+    void Logger::DeferredDeleter::operator()(Logger *logger) const noexcept
     {
-        return std::atomic_load(&g_singleton);
-    }
-
-    Logger &SingletonLogger::instance()
-    {
-        auto current = std::atomic_load(&g_singleton);
-        if (current)
-            return *current;
-
-        static Logger empty_logger{Logger::NullTag{}};
-        return empty_logger;
-    }
-
-    void SingletonLogger::release_ref(std::shared_ptr<Logger> logger)
-    {
-        if (!logger || (!logger->is_on_background_thread() && logger->can_operate()))
+        if (!logger)
             return;
-        // 后台线程不能回收自己的线程池/定时器；同步回调也不能销毁正在使用的 sink。
+        if (!logger->is_on_background_thread() && logger->can_operate())
+        {
+            delete logger;
+            return;
+        }
         try
         {
-            std::thread([ptr = std::move(logger)]() mutable { ptr.reset(); }).detach();
+            reaper_instance().enqueue(logger);
         }
         catch (...)
         {
-            // 无法启动回收线程时，析构中的保护分支会避免自等待。
+            // 连入队都做不到时，只能泄漏以免自等待；
+            // Logger::~Logger 的同名保护分支也覆盖直接析构的情形。
+            std::fprintf(stderr, "[mylog] cannot hand off logger destruction; "
+                                 "resources are leaked to avoid joining itself\n");
         }
+    }
+
+    std::shared_ptr<Logger> SingletonLogger::acquire()
+    {
+        const std::uint64_t generation = g_generation.load(std::memory_order_acquire);
+        if (generation == t_cached_generation)
+            return t_cached_singleton.lock(); // 快路径：只做一次引用计数
+
+        auto snapshot = std::atomic_load(&g_singleton);
+        t_cached_singleton = snapshot;
+        t_cached_generation = generation;
+        return snapshot;
     }
 
     InitResult SingletonLogger::init_checked(const LogConfig &cfg)
     {
-        // 关键：构造在锁外完成。初始化失败时错误回调可以安全地再次
-        // 访问单例（例如 LOGS_ERROR），不会自锁。
-        auto candidate = std::make_shared<Logger>(cfg);
-        if (!candidate->is_initialized())
+        InitResult refused;
+        if (t_in_singleton_control)
         {
-            InitResult result = candidate->init_result();
-            return result; // 失败时保留原有实例，不影响已在运行的服务
+            refused.error = InitError::Unknown;
+            refused.message = "[mylog] init() called from a logger callback; ignored";
+            return refused;
         }
+
+        ControlScope scope; // 覆盖构造 + 登记，回调里再调 init/shutdown 被拒绝
+
+        // 先等"在后台线程释放的最后一个快照"真正销毁：它可能还占着日志文件，
+        // 否则紧接着的同文件初始化会莫名报 "still in use"。
+        reaper_instance().drain();
+
+        // 构造在锁外：文件打开、目录创建、线程池启动都不能把日志调用者串行化。
+        // 注册延后到锁内，保证"全局指针"和"registry 里的名字"永远是同一个实例。
+        std::shared_ptr<Logger> candidate(new Logger(cfg, Logger::DeferRegister{}),
+                                         Logger::DeferredDeleter{});
+        if (!candidate->is_initialized())
+            return candidate->init_result(); // 失败时保留原有实例，不影响已在运行的服务
 
         std::shared_ptr<Logger> previous;
         {
             std::lock_guard<std::mutex> lock(g_singleton_mutex);
-            previous = std::atomic_load(&g_singleton);
-            std::atomic_store(&g_singleton, candidate);
+            previous = std::atomic_exchange(&g_singleton, candidate);
+            try
+            {
+                candidate->attach_registry();
+            }
+            catch (const std::exception &ex)
+            {
+                // 极端情况（同名注册与外部 spdlog 用户撞车）：回滚到旧实例。
+                std::atomic_store(&g_singleton, previous);
+                g_generation.fetch_add(1, std::memory_order_release);
+                InitResult result = candidate->init_result();
+                result.ok = false;
+                result.degraded = false;
+                result.error = InitError::InvalidConfig;
+                result.message = std::string("[mylog] cannot register logger name: ") + ex.what();
+                report_error(candidate->state_->error_handler, result.message);
+                return result;
+            }
+            // 指针换完再 +1：读者只会看到"旧指针+旧代际号"或"新指针+新代际号"，
+            // 不会把旧指针配上新代际号（那会让线程本地缓存永久指向旧实例）。
+            g_generation.fetch_add(1, std::memory_order_release);
         }
 
-        // 锁外释放旧实例：若仍有 acquire() 快照存活，
-        // 资源会延迟到最后一个快照释放时回收。
-        release_ref(std::move(previous));
+        // 锁外释放旧实例：若仍有 acquire() 快照存活，资源会延迟到最后一个
+        // 快照释放时回收；若那个释放发生在后台线程，由回收线程接手。
+        previous.reset();
+        reaper_instance().drain();
         return candidate->init_result();
     }
 
@@ -1088,14 +1579,21 @@ namespace mylog
 
     void SingletonLogger::shutdown()
     {
+        if (t_in_singleton_control)
+            return; // 从回调里调过来的，先让外层 init 跑完
+
         std::shared_ptr<Logger> previous;
         {
             std::lock_guard<std::mutex> lock(g_singleton_mutex);
-            previous = std::atomic_load(&g_singleton);
-            std::atomic_store(&g_singleton, std::shared_ptr<Logger>{});
+            previous = std::atomic_exchange(&g_singleton, std::shared_ptr<Logger>{});
+            // 同样：先清指针，再让线程本地缓存失效。
+            g_generation.fetch_add(1, std::memory_order_release);
         }
 
-        release_ref(std::move(previous));
+        // 同 init_checked：不在锁内做资源回收，避免慢盘或线程 join 阻塞所有日志调用者。
+        previous.reset();
+        // 等"在后台线程释放的最后一个快照"真正销毁，随后可以立刻重开同一文件。
+        reaper_instance().drain();
     }
 
 } // namespace mylog

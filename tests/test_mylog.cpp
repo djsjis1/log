@@ -27,6 +27,12 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace mylog;
 
@@ -134,75 +140,82 @@ namespace
         return lines;
     }
 
-    // 受控 sink：可以让后台线程停在指定条数的消息上，从而确定性地构造
-    // “后台正在写 A、队列里已有一条 B”这种状态，而不依赖大量压测碰概率。
-    class gated_sink final : public spdlog::sinks::base_sink<std::mutex>
+    // 受控 sink 的观测数据独立于 sink 所有权：日志器销毁后仍能安全读结果。
+    struct GatedProbe
     {
-    public:
-        explicit gated_sink(std::size_t gate_count) : gate_count_(gate_count) {}
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<std::string> messages;
+        std::size_t flushes = 0;
+        std::size_t entered = 0;
+        bool gate_open = false;
 
-        bool wait_until_entered()
+        bool wait_entered()
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            const bool entered = cv_.wait_for(lock, std::chrono::seconds(5), [this]
-                                              { return entered_ > 0; });
-            if (!entered)
+            std::unique_lock<std::mutex> lock(mutex);
+            const bool ok = cv.wait_for(lock, std::chrono::seconds(5), [this]
+                                        { return entered > 0; });
+            if (!ok)
             {
-                gate_open_ = true; // 失败后也让析构能够排空线程池，避免测试卡死
-                cv_.notify_all();
+                gate_open = true; // 失败后开闸，避免关闭流程被卡死
+                cv.notify_all();
             }
-            return entered;
+            return ok;
         }
 
         void open_gate()
         {
             {
-                std::lock_guard<std::mutex> lock(mutex_);
-                gate_open_ = true;
+                std::lock_guard<std::mutex> lock(mutex);
+                gate_open = true;
             }
-            cv_.notify_all();
+            cv.notify_all();
         }
 
-        std::vector<std::string> messages()
+        std::vector<std::string> taken_messages()
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            return messages_;
+            std::lock_guard<std::mutex> lock(mutex);
+            return messages;
         }
 
-        std::size_t flush_count()
+        std::size_t taken_flushes()
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            return flush_count_;
+            std::lock_guard<std::mutex> lock(mutex);
+            return flushes;
         }
+    };
+
+    // 受控 sink：可以让后台线程停在指定条数的消息上，从而确定性地构造
+    // “后台正在写 A、队列里已有一条 B”这种状态，而不依赖大量压测碰概率。
+    class gated_sink final : public spdlog::sinks::base_sink<std::mutex>
+    {
+    public:
+        gated_sink(std::shared_ptr<GatedProbe> probe, std::size_t gate_count)
+            : probe_(std::move(probe)), gate_count_(gate_count) {}
 
     protected:
         void sink_it_(const spdlog::details::log_msg &msg) override
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            if (entered_ < gate_count_)
+            std::unique_lock<std::mutex> lock(probe_->mutex);
+            if (probe_->entered < gate_count_)
             {
-                ++entered_;
-                cv_.notify_all();
-                cv_.wait(lock, [this]
-                         { return gate_open_; });
+                ++probe_->entered;
+                probe_->cv.notify_all();
+                probe_->cv.wait(lock, [this]
+                                { return probe_->gate_open; });
             }
-            messages_.emplace_back(msg.payload.data(), msg.payload.size());
+            probe_->messages.emplace_back(msg.payload.data(), msg.payload.size());
         }
 
         void flush_() override
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++flush_count_;
+            std::lock_guard<std::mutex> lock(probe_->mutex);
+            ++probe_->flushes;
         }
 
     private:
-        std::mutex mutex_;
-        std::condition_variable cv_;
-        std::vector<std::string> messages_;
-        std::size_t entered_ = 0;
-        std::size_t flush_count_ = 0;
+        std::shared_ptr<GatedProbe> probe_;
         std::size_t gate_count_;
-        bool gate_open_ = false;
     };
 
     // 观测数据独立于 sink 所有权，销毁 sink 后仍能安全检查结果。
@@ -280,6 +293,89 @@ namespace
         return cfg;
     }
 
+    // 观测数据独立于 sink 所有权：日志器销毁后仍能安全检查“写入 / 刷新”的先后顺序。
+    struct OrderedProbe
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<std::string> events;
+        bool entered = false;
+        bool gate_open = false;
+        bool flushed = false;
+
+        bool wait_entered()
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            const bool ok = cv.wait_for(lock, std::chrono::seconds(5), [this] { return entered; });
+            if (!ok)
+            {
+                gate_open = true; // 失败后开闸，避免关闭流程被卡死
+                cv.notify_all();
+            }
+            return ok;
+        }
+
+        void open_gate()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                gate_open = true;
+            }
+            cv.notify_all();
+        }
+
+        bool wait_flush(std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            return cv.wait_for(lock, timeout, [this] { return flushed; });
+        }
+    };
+
+    // 记录“写入 / 刷新”先后顺序的 sink。log() 里可以把消费线程停在写入之前，
+    // 用来确定性地构造“另一条消费线程已经刷新、最后一条日志还没写”的时序。
+    class ordered_sink final : public spdlog::sinks::sink
+    {
+    public:
+        explicit ordered_sink(std::shared_ptr<OrderedProbe> probe) : probe_(std::move(probe)) {}
+
+        void log(const spdlog::details::log_msg &msg) override
+        {
+            const std::string text(msg.payload.data(), msg.payload.size());
+            if (text == "hold")
+            {
+                // 卡在“已从队列取出、还没写入”这一步，且不持有观测锁
+                std::unique_lock<std::mutex> lock(probe_->mutex);
+                probe_->entered = true;
+                probe_->cv.notify_all();
+                probe_->cv.wait(lock, [this] { return probe_->gate_open; });
+            }
+            push("w:" + text);
+        }
+
+        void flush() override
+        {
+            {
+                std::lock_guard<std::mutex> lock(probe_->mutex);
+                probe_->flushed = true;
+            }
+            probe_->cv.notify_all();
+            push("f");
+        }
+
+        void set_pattern(const std::string &) override {}
+        void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
+
+    private:
+        void push(std::string event)
+        {
+            std::lock_guard<std::mutex> lock(probe_->mutex);
+            probe_->events.push_back(std::move(event));
+            probe_->cv.notify_all();
+        }
+
+        std::shared_ptr<OrderedProbe> probe_;
+    };
+
     class prefix_formatter final : public spdlog::formatter
     {
     public:
@@ -304,23 +400,25 @@ namespace
         return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     }
 
-    void test_empty_instance()
+    // 未初始化时的全局入口必须静默丢弃：不崩溃、不注册名字、不影响后续初始化。
+    // （旧版这里还测了已删除的 SingletonLogger::instance() 借用引用）
+    void test_uninitialized_is_silent()
     {
         spdlog::drop("app");
-
-        // 未初始化时写日志：静默丢弃，不能崩溃，也不能注册 "app"
         LOGS_INFO("this must be dropped silently");
         CHECK(spdlog::get("app") == nullptr);
+        CHECK(!SingletonLogger::acquire());
 
-        auto &borrowed = SingletonLogger::instance();
-        CHECK(!borrowed.is_initialized());
-        CHECK(borrowed.level() == Level::Off);
-        CHECK(!borrowed.should_log(Level::Info));
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("uninitialized_then_init", probe);
+        CHECK(SingletonLogger::init(cfg));
+        LOGS_INFO("after init");
+        CHECK(spdlog::get(cfg.logger_name) != nullptr);
 
-        // 空实例上的设置操作必须无副作用，不能突然开始输出
-        borrowed.set_level(Level::Info);
-        LOGS_INFO("still dropped");
-        CHECK(spdlog::get("app") == nullptr);
+        SingletonLogger::shutdown();
+        // 关闭后：快照没了，名字也从 registry 里摘掉
+        CHECK(!SingletonLogger::acquire());
+        CHECK(spdlog::get(cfg.logger_name) == nullptr);
     }
 
     void test_init_failure_callback_reentry()
@@ -674,13 +772,11 @@ namespace
         cfg.pattern = "%v";
 
         // 在初始化时注入受控 sink，不再修改运行中的目标容器。
-        gated_sink *sink = nullptr;
+        auto probe = std::make_shared<GatedProbe>();
         SinkConfig extra;
-        extra.factory = [&sink]
+        extra.factory = [probe]
         {
-            auto owned = std::make_unique<gated_sink>(1);
-            sink = owned.get();
-            return owned;
+            return std::make_unique<gated_sink>(probe, 1);
         };
         cfg.extra_sinks.push_back(extra);
         CHECK(SingletonLogger::init(cfg));
@@ -695,30 +791,28 @@ namespace
             return;
 
         LOGS_INFO("A");
-        CHECK(sink->wait_until_entered()); // 后台线程已停在 A 上
+        CHECK(probe->wait_entered()); // 后台线程已停在 A 上
 
         LOGS_INFO("B"); // 队列容量为 1，B 留在队列里
         CHECK(snapshot->stats().queue_size == 1);
 
-        // 直接调用实例的 shutdown()：它走的正是“关闭时 flush”的 release() 路径
+        // 直接调用实例的 shutdown()：它走的正是关闭时的排空 + 最终刷新路径
         auto holder = snapshot;
         std::thread closer([holder]
                            { holder->shutdown(); });
 
-        // 给关闭线程足够时间走到“投递 flush”。这一等待只影响测试能否抓住旧行为，
-        // 不影响最终判定方向：若 flush 以覆盖/丢弃方式入队，B 会永久丢失。
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-        sink->open_gate();
+        // 不需要 sleep：closer 会卡在“join 消费线程”上，直到开闸且 A、B 都写完。
+        probe->open_gate();
         closer.join();
         snapshot.reset();
         SingletonLogger::shutdown();
 
-        CHECK(sink->messages().size() >= 2);
-        CHECK(sink->flush_count() > 0 || !expect_flush);
+        const auto messages = probe->taken_messages();
+        CHECK(messages.size() >= 2);
+        CHECK(probe->taken_flushes() > 0 || !expect_flush);
 
         bool saw_b = false;
-        for (const auto &text : sink->messages())
+        for (const auto &text : messages)
         {
             if (text == "B")
                 saw_b = true;
@@ -740,13 +834,11 @@ namespace
         cfg.level = Level::Trace;
         cfg.pattern = "%v";
 
-        gated_sink *sink = nullptr;
+        auto probe = std::make_shared<GatedProbe>();
         SinkConfig extra;
-        extra.factory = [&sink]
+        extra.factory = [probe]
         {
-            auto owned = std::make_unique<gated_sink>(1);
-            sink = owned.get();
-            return owned;
+            return std::make_unique<gated_sink>(probe, 1);
         };
         cfg.extra_sinks.push_back(extra);
         CHECK(SingletonLogger::init(cfg));
@@ -767,18 +859,19 @@ namespace
         }
 
         LOGS_INFO("A");
-        CHECK(sink->wait_until_entered());
+        CHECK(probe->wait_entered());
         LOGS_INFO("B"); // 入队
         LOGS_INFO("C"); // 容量为 1，旧策略下 B 被覆盖
         CHECK(snapshot->stats().overrun_count == 1);
 
-        sink->open_gate();
+        probe->open_gate();
         SingletonLogger::shutdown(); // 关闭不应再额外丢
-        snapshot.reset();            // 最后一个引用释放时才真正 flush 并回收
+        snapshot.reset();            // 最后一个引用释放时才真正排空并回收
+        registered.reset();
 
         bool saw_b = false;
         bool saw_c = false;
-        for (const auto &text : sink->messages())
+        for (const auto &text : probe->taken_messages())
         {
             if (text == "B")
                 saw_b = true;
@@ -860,7 +953,7 @@ namespace
 
         auto snapshot = SingletonLogger::acquire();
         CHECK(snapshot != nullptr);
-        CHECK(!snapshot->is_on_worker_thread());
+        CHECK(!snapshot->is_on_background_thread());
 
         snapshot.reset();
         SingletonLogger::shutdown();
@@ -977,58 +1070,124 @@ namespace
         CHECK(fs::exists(dir / filename));
     }
 
-    // CTest 捕获真实 stdout，检查门槛和格式；不替换内置控制台 sink。
+    // 把 stdout 临时重定向到文件：控制台输出可以在进程内逐条断言，
+    // CTest 那边只需要匹配一行成功哨兵，不再硬编码整段输出。
+    class stdout_redirect
+    {
+    public:
+        explicit stdout_redirect(const fs::path &file)
+        {
+            std::fflush(stdout);
+#ifdef _WIN32
+            saved_ = _dup(_fileno(stdout));
+            FILE *redirected = nullptr;
+            freopen_s(&redirected, file.string().c_str(), "w", stdout);
+#else
+            saved_ = dup(fileno(stdout));
+            (void)std::freopen(file.string().c_str(), "w", stdout);
+#endif
+        }
+        ~stdout_redirect() { restore(); }
+        stdout_redirect(const stdout_redirect &) = delete;
+        stdout_redirect &operator=(const stdout_redirect &) = delete;
+
+        void restore()
+        {
+            if (saved_ < 0)
+                return;
+            std::fflush(stdout);
+#ifdef _WIN32
+            _dup2(saved_, _fileno(stdout));
+            _close(saved_);
+#else
+            dup2(saved_, fileno(stdout));
+            close(saved_);
+#endif
+            saved_ = -1;
+        }
+
+    private:
+        int saved_ = -1;
+    };
+
+    // 真实控制台 sink（不替换它）：先跑一遍，再对抓到文本逐项断言。
     int test_console_output()
     {
-        LogConfig cfg;
-        cfg.logger_name = "console_probe";
-        cfg.enable_file = false;
-        cfg.level = Level::Debug;
-        cfg.console_level = Level::Warn;
-        cfg.pattern = "inherit:%v";
-        Logger logger(cfg);
-        CHECK(logger.is_initialized());
-        LOG_DEBUG(logger, "forbidden-console");
-        LOG_TRACE(logger, "forbidden-total");
-        LOG_WARN(logger, "first");
-        logger.set_console_pattern("console:%l:%v");
-        LOG_WARN(logger, "dedicated");
-        logger.set_level(Level::Error);
-        LOG_WARN(logger, "forbidden-total-after-change");
-        logger.set_console_level(Level::Trace);
-        LOG_WARN(logger, "forbidden-total-after-sink-lowered");
-        logger.set_level(Level::Trace);
-        LOG_DEBUG(logger, "lowered");
-        logger.set_formatter(std::make_unique<prefix_formatter>(std::make_shared<int>(0)));
-        LOG_INFO(logger, "formatter");
-        logger.set_console_pattern("local:%v");
-        LOG_INFO(logger, "override-formatter");
-        logger.set_pattern("all:%v");
-        LOG_INFO(logger, "unified");
-        logger.set_file_pattern("forbidden-absent-file");
-        LOG_INFO(logger, "still-unified");
-        logger.set_console_pattern("");
-        LOG_ERROR(logger, "forbidden-empty-runtime");
-        logger.set_console_pattern("final:%v");
-        logger.set_console_level(Level::Off);
-        LOG_CRITICAL(logger, "forbidden-off");
-        logger.set_console_level(Level::Error);
-        LOG_ERROR(logger, "restored");
-        logger.shutdown();
+        std::error_code ec;
+        fs::create_directories(kBase, ec);
+        const fs::path captured = kBase / "console_output.txt";
 
-        cfg.console_pattern = "";
-        cfg.pattern = "forbidden-inheritance:%v";
         {
-            Logger blank(cfg);
-            CHECK(blank.is_initialized());
-            LOG_WARN(blank, "forbidden-empty-initial");
+            stdout_redirect redirect(captured);
+
+            LogConfig cfg;
+            cfg.logger_name = "console_probe";
+            cfg.enable_file = false;
+            cfg.level = Level::Debug;
+            cfg.console_level = Level::Warn;
+            cfg.pattern = "inherit:%v";
+            Logger logger(cfg);
+            CHECK(logger.is_initialized());
+            LOG_DEBUG(logger, "forbidden-console");
+            LOG_TRACE(logger, "forbidden-total");
+            LOG_WARN(logger, "first");
+            logger.set_console_pattern("console:%l:%v");
+            LOG_WARN(logger, "dedicated");
+            logger.set_level(Level::Error);
+            LOG_WARN(logger, "forbidden-total-after-change");
+            logger.set_console_level(Level::Trace);
+            LOG_WARN(logger, "forbidden-total-after-sink-lowered");
+            logger.set_level(Level::Trace);
+            LOG_DEBUG(logger, "lowered");
+            logger.set_formatter(std::make_unique<prefix_formatter>(std::make_shared<int>(0)));
+            LOG_INFO(logger, "formatter");
+            logger.set_console_pattern("local:%v");
+            LOG_INFO(logger, "override-formatter");
+            logger.set_pattern("all:%v");
+            LOG_INFO(logger, "unified");
+            logger.set_file_pattern("forbidden-absent-file");
+            LOG_INFO(logger, "still-unified");
+            logger.set_console_pattern("");
+            LOG_ERROR(logger, "forbidden-empty-runtime");
+            logger.set_console_pattern("final:%v");
+            logger.set_console_level(Level::Off);
+            LOG_CRITICAL(logger, "forbidden-off");
+            logger.set_console_level(Level::Error);
+            LOG_ERROR(logger, "restored");
+            logger.shutdown();
+
+            cfg.console_pattern = "";
+            cfg.pattern = "forbidden-inheritance:%v";
+            {
+                Logger blank(cfg);
+                CHECK(blank.is_initialized());
+                LOG_WARN(blank, "forbidden-empty-initial");
+            }
+            cfg.console_pattern = "configured:%v";
+            {
+                Logger configured(cfg);
+                CHECK(configured.is_initialized());
+                LOG_WARN(configured, "initial-specific");
+            }
         }
-        cfg.console_pattern = "configured:%v";
-        {
-            Logger configured(cfg);
-            CHECK(configured.is_initialized());
-            LOG_WARN(configured, "initial-specific");
-        }
+
+        const std::string text = file_text(captured);
+        const char *expected[] = {
+            "inherit:first",
+            "console:warning:dedicated",
+            "console:debug:lowered",
+            "custom:formatter",
+            "local:override-formatter",
+            "all:unified",
+            "all:still-unified",
+            "final:restored",
+            "configured:initial-specific",
+        };
+        for (const char *line : expected)
+            CHECK(text.find(line) != std::string::npos);
+        // 任何一个被门槛/空格式拦下的正文都不能出现
+        CHECK(text.find("forbidden") == std::string::npos);
+
         if (g_failures == 0)
             std::printf("console-probe-passed\n");
         return g_failures != 0;
@@ -1335,7 +1494,7 @@ namespace
         cfg.log_callback = [&](const LogEvent &event)
         {
             ++calls;
-            if (same->is_on_worker_thread() != async ||
+            if (same->is_on_background_thread() != async ||
                 ((std::this_thread::get_id() == caller) == async))
                 correct_thread = false;
             {
@@ -1442,24 +1601,68 @@ namespace
         cfg.callback_level = Level::Trace;
         std::vector<std::string> events;
         cfg.log_callback = [&](const LogEvent &event) { events.push_back(event.message); };
-        gated_sink *sink = nullptr;
+        auto probe = std::make_shared<GatedProbe>();
         SinkConfig extra;
-        extra.factory = [&]
+        extra.factory = [probe]
         {
-            auto owned = std::make_unique<gated_sink>(1);
-            sink = owned.get();
-            return owned;
+            return std::make_unique<gated_sink>(probe, 1);
         };
         cfg.extra_sinks.push_back(extra);
         Logger logger(cfg);
         LOG_INFO(logger, "A");
-        CHECK(sink->wait_until_entered());
+        CHECK(probe->wait_entered());
         LOG_INFO(logger, "B");
         LOG_INFO(logger, "C");
         CHECK(logger.stats().discard_count == 1);
-        sink->open_gate();
+        probe->open_gate();
         logger.shutdown();
         CHECK(events == std::vector<std::string>({"A", "B"}));
+    }
+
+    // 定时刷新是进程级共享调度：多个实例（同间隔/不同间隔）都能被刷到，
+    // 关闭其中一个只停它自己的刷新，其余不受影响。
+    void test_shared_flush_scheduler()
+    {
+        auto probe_a = std::make_shared<Probe>();
+        auto probe_b = std::make_shared<Probe>();
+        auto probe_c = std::make_shared<Probe>();
+
+        auto cfg_a = probe_config("sched_a", probe_a);
+        cfg_a.flush_interval = std::chrono::milliseconds(20);
+        auto cfg_b = probe_config("sched_b", probe_b);
+        cfg_b.flush_interval = std::chrono::milliseconds(20); // 同间隔：共用一个桶
+        auto cfg_c = probe_config("sched_c", probe_c);
+        cfg_c.flush_interval = std::chrono::milliseconds(40); // 不同间隔：另一个桶
+
+        Logger a(cfg_a);
+        Logger b(cfg_b);
+        Logger c(cfg_c);
+        CHECK(a.is_initialized() && b.is_initialized() && c.is_initialized());
+
+        CHECK(probe_a->wait_flush());
+        CHECK(probe_b->wait_flush());
+        CHECK(probe_c->wait_flush());
+
+        a.shutdown();
+        std::size_t a_flushes = 0;
+        std::size_t b_flushes = 0;
+        {
+            std::lock_guard<std::mutex> lock(probe_a->mutex);
+            a_flushes = probe_a->flushes;
+        }
+        {
+            std::lock_guard<std::mutex> lock(probe_b->mutex);
+            b_flushes = probe_b->flushes;
+        }
+
+        CHECK(probe_b->wait_flush(b_flushes + 1)); // b 仍在被刷
+        {
+            std::lock_guard<std::mutex> lock(probe_a->mutex);
+            CHECK(probe_a->flushes == a_flushes); // a 已注销，不再被刷
+        }
+
+        b.shutdown();
+        c.shutdown();
     }
 
     void test_periodic_flush(bool async)
@@ -1513,28 +1716,25 @@ namespace
         cfg.async_queue_size = 1;
         cfg.async_overflow = policy;
         cfg.flush_interval = std::chrono::milliseconds(100);
-        gated_sink *sink = nullptr;
+        auto probe = std::make_shared<GatedProbe>();
         SinkConfig extra;
-        extra.factory = [&]
+        extra.factory = [probe]
         {
-            auto owned = std::make_unique<gated_sink>(1);
-            sink = owned.get();
-            return owned;
+            return std::make_unique<gated_sink>(probe, 1);
         };
         cfg.extra_sinks.push_back(extra);
         Logger logger(cfg);
-        auto raw = spdlog::get(cfg.logger_name); // 仅保持 sink 存活，便于关闭后检查
         LOG_INFO(logger, "A");
-        CHECK(sink->wait_until_entered());
+        CHECK(probe->wait_entered());
         LOG_INFO(logger, "B");
         // 后台停在 A、队列被 B 占满；定时刷新不能覆盖 B 或增加丢弃统计。
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         CHECK(logger.stats().overrun_count == 0);
         CHECK(logger.stats().discard_count == 0);
-        sink->open_gate();
+        probe->open_gate();
         logger.shutdown();
-        CHECK(sink->messages() == std::vector<std::string>({"A", "B"}));
-        CHECK(sink->flush_count() >= 2); // 已触发的周期刷新 + 关闭刷新
+        CHECK(probe->taken_messages() == std::vector<std::string>({"A", "B"}));
+        CHECK(probe->taken_flushes() >= 2); // 已触发的周期刷新 + 关闭刷新
     }
 
     void test_background_self_shutdown(bool timer)
@@ -1546,12 +1746,13 @@ namespace
         std::atomic<bool> correct{false};
         auto close_from_background = [&]
         {
-            auto &borrowed = SingletonLogger::instance();
-            if (!borrowed.is_initialized() || acted.exchange(true))
+            // 持有一份快照：释放点就在后台线程的栈上，最后一个引用也在这里归零。
+            auto snapshot = SingletonLogger::acquire();
+            if (!snapshot || acted.exchange(true))
                 return;
-            correct = (borrowed.is_on_worker_thread() == !timer);
-            borrowed.shutdown(); // 必须拒绝自关闭
-            if (!borrowed.is_initialized())
+            correct = snapshot->is_on_background_thread();
+            snapshot->shutdown(); // 必须拒绝自关闭
+            if (!snapshot->is_initialized())
                 correct = false;
             SingletonLogger::shutdown(); // 实际回收由独立线程执行
         };
@@ -1577,7 +1778,14 @@ namespace
 
     void test_new_empty_and_failure_paths()
     {
-        auto &empty = SingletonLogger::instance();
+        // 未初始化的实例（非法级别 => 构造失败，没有任何 sink）：设置操作必须无副作用
+        LogConfig empty_cfg;
+        empty_cfg.logger_name = "uninitialized_setters";
+        empty_cfg.enable_console = false;
+        empty_cfg.enable_file = false;
+        empty_cfg.console_level = static_cast<Level>(99);
+        empty_cfg.error_handler = [](const std::string &) {};
+        Logger empty(empty_cfg);
         empty.set_console_level(Level::Debug);
         empty.set_file_level(Level::Debug);
         empty.set_console_pattern("x");
@@ -1587,6 +1795,9 @@ namespace
         empty.dump_backtrace();
         empty.disable_backtrace();
         CHECK(!empty.is_initialized());
+        CHECK(empty.stats().queue_size == 0);
+        CHECK(!empty.should_log(Level::Info));
+
         auto probe = std::make_shared<Probe>();
         auto cfg = probe_config("failure_with_timer", probe);
         cfg.flush_interval = std::chrono::milliseconds(1);
@@ -1699,6 +1910,542 @@ namespace
         CHECK(probe->messages.size() == 1);
     }
 
+    // 两个实例都开启回溯、回调里向对方写日志，同时导出回溯。
+    // 修复前：A 持有自身回溯锁等待 B 的回溯锁，B 反向等待 A，两个线程永久卡死。
+    // 修复后：所有导出串行化，同一时刻只有一个线程持有回溯锁，两边都能完成。
+    void test_concurrent_backtrace_dump_with_cross_writes()
+    {
+        auto probe_a = std::make_shared<Probe>();
+        auto probe_b = std::make_shared<Probe>();
+        auto cfg_a = probe_config("dump_cross_a", probe_a);
+        auto cfg_b = probe_config("dump_cross_b", probe_b);
+        Logger *first = nullptr;
+        Logger *second = nullptr;
+
+        // 回调里先在“补打缓存”时碰头：让两个线程都停在自己的回溯锁内，
+        // 再往对方写 debug（低于总门槛，只会进对方的回溯缓存）。
+        std::mutex meet_mutex;
+        std::condition_variable meet_cv;
+        int arrived = 0;
+        auto rendezvous = [&]
+        {
+            std::unique_lock<std::mutex> lock(meet_mutex);
+            ++arrived;
+            meet_cv.notify_all();
+            meet_cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return arrived >= 2; });
+        };
+
+        for (auto *config : {&cfg_a, &cfg_b})
+        {
+            config->level = Level::Info;
+            config->backtrace_capacity = 1;
+            config->callback_level = Level::Trace; // 开始/结束分隔线也会通知
+        }
+        cfg_a.log_callback = [&](const LogEvent &event)
+        {
+            // Start/End 分隔线在回溯锁外发出，只有补打的缓存消息才处于锁内：
+            // 在那种回调里会合，才能确定两个线程都拿着各自的回溯锁。
+            if (event.message.find("Backtrace") != std::string::npos)
+                return;
+            rendezvous();
+            LOG_DEBUG(*second, "cross-a");
+        };
+        cfg_b.log_callback = [&](const LogEvent &event)
+        {
+            if (event.message.find("Backtrace") != std::string::npos)
+                return;
+            rendezvous();
+            LOG_DEBUG(*first, "cross-b");
+        };
+
+        Logger a(cfg_a);
+        Logger b(cfg_b);
+        first = &a;
+        second = &b;
+        CHECK(a.is_initialized() && b.is_initialized());
+        LOG_DEBUG(a, "cached-a");
+        LOG_DEBUG(b, "cached-b");
+
+        std::thread dumper_a([&] { a.dump_backtrace(); });
+        std::thread dumper_b([&] { b.dump_backtrace(); });
+        dumper_a.join();
+        dumper_b.join();
+
+        // 每个实例导出 Start + 一条缓存 + End；卡死时根本走不到这里
+        CHECK(probe_a->messages.size() == 3);
+        CHECK(probe_b->messages.size() == 3);
+    }
+
+    // 多消费线程下关闭：先执行到的 flush 可能早于最后一条写入。
+    // 修复前只向队列投递一个刷新请求，另一条消费线程先刷、最后一条日志随后才写。
+    void test_async_close_final_flush_order()
+    {
+        auto probe = std::make_shared<OrderedProbe>();
+        LogConfig cfg;
+        cfg.logger_name = "final_flush_order";
+        cfg.enable_console = false;
+        cfg.enable_file = false;
+        cfg.async = true;
+        cfg.async_queue_size = 16;
+        cfg.async_thread_count = 2; // 关键：另一条消费线程可以先把刷新请求执行完
+        cfg.level = Level::Trace;
+        cfg.pattern = "%v";
+        SinkConfig extra;
+        extra.factory = [probe]
+        {
+            return std::make_unique<ordered_sink>(probe);
+        };
+        cfg.extra_sinks.push_back(extra);
+
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+
+        LOG_INFO(logger, "hold");
+        CHECK(probe->wait_entered()); // 消费线程 A 已取出日志，但还没写入
+
+        std::thread closer([&logger] { logger.shutdown(); });
+
+        // 修复前关闭会把 flush 投进队列：空闲的消费线程先刷新，随后这条写入才落下。
+        // 这里只等待旧行为收敛，不影响断言方向（断言只看最终顺序）。
+        probe->wait_flush(std::chrono::milliseconds(1000));
+        probe->open_gate();
+        closer.join();
+
+        std::vector<std::string> events;
+        {
+            std::lock_guard<std::mutex> lock(probe->mutex);
+            events = probe->events;
+        }
+        CHECK(std::count(events.begin(), events.end(), "w:hold") == 1);
+        CHECK(!events.empty());
+        if (events.empty())
+            return;
+        // 最后一步必须是刷新：证明最后一条写入之后还有一次同步刷新
+        CHECK(events.back() == "f");
+    }
+
+    // 定时刷新的错误回调在定时线程上运行，它可能就是最后一个快照的释放点。
+    // 修复前：后台线程上的析构只能“泄漏状态保命”，定时器不停、文件占用不归还。
+    void test_last_snapshot_released_on_timer_thread()
+    {
+        const fs::path dir = kBase / "timer_release";
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("timer_release", probe);
+        cfg.enable_file = true;
+        cfg.rotation = LogConfig::RotationPolicy::None;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "timer.log";
+        cfg.flush_interval = std::chrono::milliseconds(20);
+        probe->throw_flush = true; // 每次刷新都失败，从而在定时线程上进入 error_handler
+
+        std::atomic<bool> handled{false};
+        cfg.error_handler = [&](const std::string &)
+        {
+            auto snapshot = SingletonLogger::acquire();
+            if (!snapshot)
+                return; // 初始化还没完成，等下一次刷新
+            if (handled.exchange(true))
+                return;
+            SingletonLogger::shutdown(); // 只解除全局引用，快照仍是最新一份
+            // snapshot 在定时线程的栈上析构：最后一个引用在后台线程释放
+        };
+
+        CHECK(SingletonLogger::init(cfg));
+        CHECK(probe->wait_destroyed()); // 修复前：泄漏导致 sink 永不销毁，超时失败
+        CHECK(handled.load());
+        CHECK(!SingletonLogger::acquire());
+
+        // 资源真的回收了：同一文件可以重新打开（修复前会被 "still in use" 拒绝）
+        probe->throw_flush = false;
+        auto reopened = cfg;
+        reopened.logger_name = "timer_release_again";
+        reopened.flush_interval = std::chrono::milliseconds(0);
+        reopened.error_handler = nullptr;
+        CHECK(SingletonLogger::init(reopened));
+        LOGS_INFO("reopened after timer release");
+        SingletonLogger::shutdown();
+    }
+
+    // 运行期被过滤的日志不能求值参数；放行时恰好求值一次（不能因新增的门禁变成两次）。
+    void test_macro_does_not_evaluate_when_filtered()
+    {
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("macro_eval", probe);
+        cfg.level = Level::Warn;
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+
+        int evals = 0;
+        LOG_INFO(logger, "{}", ++evals);
+        LOG_DEBUG(logger, "{}", ++evals);
+        CHECK(evals == 0);
+        LOG_WARN(logger, "{}", ++evals);
+        CHECK(evals == 1);
+
+        CHECK(SingletonLogger::init(cfg));
+        evals = 0;
+        LOGS_INFO("{}", ++evals);
+        LOGS_TRACE("{}", ++evals);
+        CHECK(evals == 0);
+        LOGS_WARN("{}", ++evals);
+        CHECK(evals == 1);
+        SingletonLogger::shutdown();
+    }
+
+    // 显式 flush() 不能按溢出策略挤掉已排队的日志（修复前 flush 会覆盖 B）。
+    void test_flush_does_not_drop_queued_log()
+    {
+        LogConfig cfg;
+        cfg.logger_name = "flush_no_drop";
+        cfg.enable_console = false;
+        cfg.enable_file = false;
+        cfg.async = true;
+        cfg.async_queue_size = 1;
+        cfg.async_thread_count = 1;
+        cfg.async_overflow = OverflowPolicy::OverrunOldest;
+        cfg.level = Level::Trace;
+        cfg.pattern = "%v";
+
+        auto probe = std::make_shared<GatedProbe>();
+        SinkConfig extra;
+        extra.factory = [probe]
+        {
+            return std::make_unique<gated_sink>(probe, 1);
+        };
+        cfg.extra_sinks.push_back(extra);
+
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+
+        LOG_INFO(logger, "A");
+        CHECK(probe->wait_entered());
+        LOG_INFO(logger, "B"); // 容量为 1，队列已满
+
+        // flush 以 block 方式入队：需要在另一条线程上开闸，它才能拿到位置。
+        // 旧实现按 OverrunOldest 直接入队，B 会被这条控制消息挤掉。
+        std::thread opener([&probe]
+                           {
+                               std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                               probe->open_gate();
+                           });
+        logger.flush();
+        opener.join();
+
+        CHECK(logger.stats().overrun_count == 0);
+        logger.shutdown();
+
+        bool saw_b = false;
+        for (const auto &text : probe->taken_messages())
+            if (text == "B")
+                saw_b = true;
+        CHECK(saw_b);
+    }
+
+    // 最后一个快照在后台线程释放后，shutdown() 返回时资源必须已经回收，
+    // 随后可以立刻重开同一文件（修复前销毁被 detach 出去，这里会拿到旧占用）。
+    void test_background_release_finishes_before_shutdown_returns()
+    {
+        const fs::path dir = kBase / "bg_release";
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("bg_release", probe);
+        cfg.enable_file = true;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "bg_release.log";
+        cfg.pattern = "%v";
+        cfg.async = true;
+        cfg.flush_interval = std::chrono::milliseconds(20);
+        probe->throw_flush = true;
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool released_on_background = false;
+        cfg.error_handler = [&](const std::string &)
+        {
+            auto snapshot = SingletonLogger::acquire();
+            if (!snapshot)
+                return;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (released_on_background)
+                    return;
+            }
+            SingletonLogger::shutdown(); // 后台线程上解除全局持有
+            snapshot.reset();            // 最后一个引用也在这里归零
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released_on_background = true;
+            }
+            cv.notify_all();
+        };
+
+        CHECK(SingletonLogger::init(cfg));
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            CHECK(cv.wait_for(lock, std::chrono::seconds(5), [&]
+                              { return released_on_background; }));
+        }
+
+        SingletonLogger::shutdown(); // 回收可能还在进行中，这里必须等它结束
+        std::size_t destroyed = 0;
+        {
+            std::lock_guard<std::mutex> lock(probe->mutex);
+            destroyed = probe->destroyed;
+        }
+        CHECK(destroyed == 1);
+
+        // 文件占用已归还：同一文件可以立刻重开
+        probe->throw_flush = false;
+        cfg.flush_interval = std::chrono::milliseconds(0);
+        cfg.error_handler = nullptr;
+        cfg.logger_name = "bg_release_again";
+        CHECK(SingletonLogger::init(cfg));
+        LOGS_INFO("reopened");
+        SingletonLogger::shutdown();
+    }
+
+    // 同名并发初始化后，“全局指针”与“registry 里的名字”必须指向同一个实例。
+    // 不使用文件目标，避免文件占用把并发折叠成“只有一个能成功”。
+    void test_concurrent_same_name_init_consistency()
+    {
+        auto make_config = []
+        {
+            auto probe = std::make_shared<Probe>();
+            auto cfg = probe_config("same_name", probe);
+            return cfg;
+        };
+
+        for (int round = 0; round < 20; ++round)
+        {
+            std::atomic<bool> start{false};
+            std::vector<std::thread> threads;
+            for (int i = 0; i < 8; ++i)
+            {
+                threads.emplace_back([&, i]
+                                     {
+                                         while (!start.load(std::memory_order_acquire))
+                                             std::this_thread::yield();
+                                         SingletonLogger::init(make_config());
+                                     });
+            }
+            start.store(true, std::memory_order_release);
+            for (auto &thread : threads)
+                thread.join();
+
+            auto snapshot = SingletonLogger::acquire();
+            CHECK(snapshot != nullptr);
+            CHECK(spdlog::get("same_name") != nullptr);
+
+            // 关闭时封装会用 get(name) 与自己的内部日志器做身份比对；若两者已经分叉
+            // （初始化把注册和换指针拆到两个临界区），这里就会留下一个永久的残留项。
+            SingletonLogger::shutdown();
+            snapshot.reset();
+            CHECK(spdlog::get("same_name") == nullptr);
+        }
+    }
+
+    // 关闭后对外就是“未初始化的空实例”，但名字不变；文件占用已归还。
+    void test_state_after_shutdown()
+    {
+        const fs::path dir = kBase / "state";
+        LogConfig cfg;
+        cfg.logger_name = "state_after";
+        cfg.enable_console = false;
+        cfg.enable_file = true;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "state.log";
+        {
+            Logger logger(cfg);
+            CHECK(logger.is_initialized());
+            CHECK(logger.name() == "state_after");
+            logger.shutdown();
+
+            CHECK(!logger.is_initialized());
+            CHECK(logger.name() == "state_after"); // 关闭不清空名字
+            CHECK(!logger.init_result().ok);
+            CHECK(!logger.init_result().degraded);
+            CHECK(logger.init_result().error == InitError::None);
+            CHECK(logger.init_result().message.empty());
+            CHECK(logger.level() == Level::Off);
+            logger.shutdown(); // 重复关闭必须安全
+        }
+        CHECK(SingletonLogger::init(cfg));
+        SingletonLogger::shutdown();
+    }
+
+    // 非法 Level（调用方 static_cast 出来的）必须被拒绝，不能静默变成 Info。
+    void test_invalid_level_is_rejected()
+    {
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("invalid_level", probe);
+        cfg.level = Level::Warn;
+        std::atomic<int> errors{0};
+        cfg.error_handler = [&](const std::string &msg)
+        {
+            if (msg.find("invalid level") != std::string::npos)
+                ++errors;
+        };
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+        CHECK(logger.level() == Level::Warn);
+
+        logger.set_level(static_cast<Level>(42));
+        CHECK(logger.level() == Level::Warn); // 值保持不变
+        logger.set_flush_level(static_cast<Level>(-3));
+        CHECK(errors == 2); // 控制台/文件目标未启用，对应 setter 直接返回
+
+        logger.set_level(Level::Off);
+        CHECK(logger.level() == Level::Off);
+        logger.shutdown();
+    }
+
+    // 移动赋值：目标接管状态，源变成空壳，文件占用随旧内容释放。
+    void test_move_assignment()
+    {
+        const fs::path dir = kBase / "move_assign";
+        LogConfig cfg;
+        cfg.logger_name = "move_a";
+        cfg.enable_console = false;
+        cfg.enable_file = true;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "a.log";
+        cfg.pattern = "%v";
+
+        Logger first(cfg);
+        CHECK(first.is_initialized());
+
+        LogConfig other_cfg = cfg;
+        other_cfg.logger_name = "move_b";
+        other_cfg.log_file = "b.log";
+        Logger second(other_cfg);
+        CHECK(second.is_initialized());
+
+        second = std::move(first);
+        CHECK(second.is_initialized());
+        CHECK(second.name() == "move_a");
+        CHECK(!first.is_initialized()); // 迁走的实例变成空壳
+        CHECK(first.name().empty());
+
+        LOG_INFO(second, "after-move-assign");
+        second.shutdown();
+        CHECK(count_lines(dir / "a.log") == 1);
+
+        // b.log 的占用已随被覆盖的旧内容释放
+        CHECK(SingletonLogger::init(other_cfg));
+        SingletonLogger::shutdown();
+    }
+
+    // flush_and_wait：异步下返回时日志已经落盘（不需要 shutdown）。
+    void test_flush_and_wait()
+    {
+        const fs::path dir = kBase / "flush_wait";
+        LogConfig cfg;
+        cfg.logger_name = "flush_wait";
+        cfg.enable_console = false;
+        cfg.enable_file = true;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "flush_wait.log";
+        cfg.async = true;
+        cfg.async_queue_size = 4096;
+        cfg.pattern = "%v";
+
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+
+        const int kCount = 500;
+        for (int i = 0; i < kCount; ++i)
+            LOG_INFO(logger, "line {}", i);
+
+        // 没有 shutdown，只等刷盘：此刻文件里就该有全部行
+        CHECK(logger.flush_and_wait(std::chrono::seconds(5)));
+        CHECK(count_lines(dir / "flush_wait.log") == static_cast<std::size_t>(kCount));
+        logger.shutdown();
+
+        // 消费线程被卡住时，超时必须生效，不能无限等
+        auto probe = std::make_shared<GatedProbe>();
+        LogConfig blocked_cfg;
+        blocked_cfg.logger_name = "flush_wait_blocked";
+        blocked_cfg.enable_console = false;
+        blocked_cfg.enable_file = false;
+        blocked_cfg.async = true;
+        blocked_cfg.async_queue_size = 8;
+        blocked_cfg.level = Level::Trace;
+        blocked_cfg.pattern = "%v";
+        SinkConfig extra;
+        extra.factory = [probe]
+        {
+            return std::make_unique<gated_sink>(probe, 1);
+        };
+        blocked_cfg.extra_sinks.push_back(extra);
+
+        Logger blocked(blocked_cfg);
+        CHECK(blocked.is_initialized());
+        LOG_INFO(blocked, "hold");
+        CHECK(probe->wait_entered());
+        LOG_INFO(blocked, "queued");
+
+        const auto start = std::chrono::steady_clock::now();
+        CHECK(!blocked.flush_and_wait(std::chrono::milliseconds(50)));
+        CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+
+        probe->open_gate();
+        blocked.shutdown();
+    }
+
+    // native()：拿到底层 spdlog 日志器后，spdlog 原生 API 也生效。
+    void test_native_handle()
+    {
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("native_handle", probe);
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+
+        auto sp = logger.native();
+        CHECK(sp != nullptr);
+        if (sp)
+        {
+            sp->set_level(spdlog::level::warn); // 原生 API 改级别
+            CHECK(logger.level() == Level::Warn); // 封装侧读到同一个值
+
+            sp->log(spdlog::source_loc{}, spdlog::level::warn, "via-native-{}", 1);
+            logger.flush(); // 同步实例，刷完即可读
+            std::lock_guard<std::mutex> lock(probe->mutex);
+            CHECK(std::count(probe->messages.begin(), probe->messages.end(), "via-native-1") == 1);
+        }
+
+        logger.shutdown();
+        CHECK(logger.native() == nullptr); // 关闭后不再给原生句柄
+        sp.reset();
+    }
+
+    // 线程本地快照缓存：反复写日志让缓存热起来后，shutdown() 仍能立刻归还文件。
+    // （缓存只存 weak_ptr；如果缓存强引用，下面第二次 init 会报 still in use）
+    void test_singleton_snapshot_cache()
+    {
+        const fs::path dir = kBase / "snapshot_cache";
+        LogConfig cfg;
+        cfg.logger_name = "snapshot_cache";
+        cfg.enable_console = false;
+        cfg.enable_file = true;
+        cfg.log_dir = dir.string();
+        cfg.log_file = "cache.log";
+        cfg.pattern = "%v";
+
+        CHECK(SingletonLogger::init(cfg));
+        for (int i = 0; i < 100; ++i)
+            LOGS_INFO("cached {}", i); // 让本线程的缓存命中
+        SingletonLogger::shutdown();
+
+        // 缓存不得延长寿命：同一文件必须能立刻重开
+        CHECK(SingletonLogger::init(cfg));
+        LOGS_INFO("after reinit");
+        SingletonLogger::shutdown();
+        CHECK(count_lines(dir / "cache.log") == 101);
+
+        // 关闭后的调用仍然静默丢弃（缓存已失效，不会写到旧实例）
+        LOGS_INFO("after shutdown");
+        CHECK(count_lines(dir / "cache.log") == 101);
+    }
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1720,9 +2467,13 @@ int main(int argc, char **argv)
     test_callback_safety(false);
     test_callback_safety(true);
     test_nested_callbacks_and_backtrace();
+    test_concurrent_backtrace_dump_with_cross_writes();
+    test_async_close_final_flush_order();
+    test_last_snapshot_released_on_timer_thread();
     test_discarded_messages_have_no_callback();
     test_periodic_flush(false);
     test_periodic_flush(true);
+    test_shared_flush_scheduler();
     test_periodic_full_queue(OverflowPolicy::Block);
     test_periodic_full_queue(OverflowPolicy::OverrunOldest);
     test_periodic_full_queue(OverflowPolicy::DiscardNew);
@@ -1735,7 +2486,7 @@ int main(int argc, char **argv)
     test_callback_concurrency(true);
     test_periodic_snapshot_and_failed_reinit();
     test_explicit_console_fallback_with_extra();
-    test_empty_instance();
+    test_uninitialized_is_silent();
     test_init_failure_callback_reentry();
     test_directory_failure();
     test_file_sink_fallback();
@@ -1757,6 +2508,18 @@ int main(int argc, char **argv)
     test_normal_overrun_still_drops_oldest();
     test_concurrent_log_and_shutdown();
     test_daily_rotation();
+
+    // 本轮审计新增的回归用例
+    test_macro_does_not_evaluate_when_filtered();
+    test_flush_does_not_drop_queued_log();
+    test_background_release_finishes_before_shutdown_returns();
+    test_concurrent_same_name_init_consistency();
+    test_state_after_shutdown();
+    test_invalid_level_is_rejected();
+    test_move_assignment();
+    test_flush_and_wait();
+    test_native_handle();
+    test_singleton_snapshot_cache();
 
     fs::remove_all(kBase, ec);
 

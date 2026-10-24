@@ -40,7 +40,9 @@ target_compile_features(mylog PUBLIC cxx_std_17)
 # MSVC 默认按本地编码（GBK）读源文件，而 Logger.cpp 里有中文注释，
 # 不指定 UTF-8 会出现乱码或 C4819 警告。用 PRIVATE：只影响本库自身编译。
 if(MSVC)
-    target_compile_options(mylog PRIVATE /utf-8)
+    target_compile_options(mylog PRIVATE /utf-8 /W4)
+else()
+    target_compile_options(mylog PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # 头文件搜索路径对下游可见

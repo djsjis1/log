@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      # 并发用例有调度不确定性：重复跑才能证明“偶尔失败”不是回归。
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --repeat until-fail:3
+
+  sanitizers:
+    name: ubuntu / asan+ubsan
+    runs-on: ubuntu-latest
+    env:
+      # 回收线程对象是有意不析构的（避免与静态析构顺序纠缠），
+      # LeakSanitizer 会把它当成泄漏报错，因此只开内存错误检查。
+      ASAN_OPTIONS: detect_leaks=0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/asan
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Build
+        run: cmake --build build/asan --parallel
+
+      - name: Test
+        run: ctest --test-dir build/asan --output-on-failure
+
+  tsan:
+    # ASan 只抓越界/释放后使用，抓不到数据竞争；而本库的重点（单例快照、文件占用、
+    # 共享刷新调度器）全在并发路径上，只有 TSan 能给出“真的没问题”的证据。
+    name: ubuntu / tsan
+    runs-on: ubuntu-latest
+    env:
+      TSAN_OPTIONS: halt_on_error=1 history_size=7 second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 22.04+ 的内核把 mmap_rnd_bits 调大后，sanitizer 在启动阶段偶发
+      # "unexpected memory mapping"；放宽到 28 位，失败也不影响后续步骤。
+      - name: Relax ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/tsan
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          -DMYLOG_TEST_TIMEOUT=1500
+          -DMYLOG_PROBE_TIMEOUT=300
+
+      - name: Build
+        run: cmake --build build/tsan --parallel
+
+      # TSan 下整体慢一个数量级，这里不做 --repeat：
+      # “偶发失败”的重复验证仍由上面的 build-and-test 作业负责。
+      - name: Test
+        run: ctest --test-dir build/tsan --output-on-failure
