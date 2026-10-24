@@ -1140,10 +1140,12 @@ namespace mylog
             st->registered = false;
         }
 
-        // 先释放 logger，再销毁线程池：异步池的析构会先给每个消费线程发终止消息
-        // 再 join，队列是先进先出的，所以这里返回时已入队的日志都写进了目标。
-        st->logger.reset();
+        // 先销毁线程池：它会先给每个消费线程发终止消息再 join，队列先进先出，
+        // 返回时已入队的日志都写进了目标；这段时间 logger 仍然有效，
+        // 消费线程在收尾消息里回调用户代码也不会撞到被重置的 state。
         st->pool.reset();
+        // 再释放 logger：此后任何并发写日志都是生命周期契约禁止的用法。
+        st->logger.reset();
 
         // 多消费线程时，先执行到的 flush 可能早于最后一条写入（消费线程已从队列
         // 取出日志但还没写进目标）。写入全部结束后由当前线程再同步刷新一次，
@@ -1397,12 +1399,19 @@ namespace mylog
 
     bool Logger::should_log(Level lvl) const
     {
+        // 回调重入时不碰 state：此时别的线程可能正在 release()。
+        if (!can_operate())
+            return false;
         auto *target = impl();
         return target && target->should_log(detail::to_spdlog_level(lvl));
     }
 
     bool Logger::should_process(Level lvl) const
     {
+        // 和 log() 一样先过重入保护：宏先调这里，若在此读 state_，
+        // 用户回调里写日志时就会与另一个线程的 release() 撞上。
+        if (!can_operate())
+            return false;
         auto *target = impl();
         if (!target)
             return false;
