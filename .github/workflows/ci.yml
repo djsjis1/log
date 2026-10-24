@@ -137,8 +137,6 @@ jobs:
 
           # 同时用 annotation 发一份：annotation 无需登录即可通过 API 读取。
           if [ -f "$log" ]; then
-            msg=$(grep -m1 -A10 'WARNING: ThreadSanitizer' "$log" | tr -d '\r' | sed 's/|/\//g' | tr '\n' '~' | sed 's/~/ | /g' | cut -c1-900)
-            failed=$(sed -n '/The following tests FAILED/,$p' "$log" | head -n 3 | tr '\n' ' ')
+            msg=$(grep -m1 -A45 'WARNING: ThreadSanitizer' "$log" | tr -d '\r' | tr '\n' '~' | sed 's/~/ | /g' | cut -c1-5000)
             echo "::error title=TSan race::${msg:-no report}"
-            echo "::error title=ctest failed::${failed:-unknown}"
           fi
