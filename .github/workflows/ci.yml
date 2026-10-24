@@ -48,6 +48,18 @@ jobs:
       - name: Test
         run: ctest --test-dir build/asan --output-on-failure
 
+      - name: Publish failure details
+        if: failure()
+        run: |
+          {
+            echo '### ctest 失败详情'
+            echo '```'
+            sed -n '/The following tests FAILED/,$p' build/asan/Testing/Temporary/LastTest.log | head -n 40 || true
+            echo '--- tail of LastTest.log ---'
+            tail -n 300 build/asan/Testing/Temporary/LastTest.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   tsan:
     # ASan 只抓越界/释放后使用，抓不到数据竞争；而本库的重点（单例快照、文件占用、
     # 共享刷新调度器）全在并发路径上，只有 TSan 能给出“真的没问题”的证据。
@@ -75,7 +87,48 @@ jobs:
       - name: Build
         run: cmake --build build/tsan --parallel
 
+      # 先确认 TSan 本身能跑：Ubuntu 新内核启用了更大的 mmap 随机化时，
+      # TSan 会在启动阶段直接 abort（unexpected memory mapping），
+      # 这类环境问题和真实的 data race 在 ctest 输出里很像，必须先区分开。
+      - name: TSan smoke check
+        run: |
+          cat > /tmp/tsan_smoke.cpp <<'EOF'
+          #include <thread>
+          #include <cstdio>
+          int main() {
+              int x = 0;
+              std::thread t([&] { x = 1; });
+              t.join();
+              std::printf("tsan-smoke-ok %d\n", x);
+              return 0;
+          }
+          EOF
+          g++ -std=c++17 -g -O1 -fsanitize=thread -pthread /tmp/tsan_smoke.cpp -o /tmp/tsan_smoke
+          if setarch "$(uname -m)" -R true 2>/dev/null; then
+            setarch "$(uname -m)" -R /tmp/tsan_smoke
+          else
+            /tmp/tsan_smoke
+          fi
+
       # TSan 下整体慢一个数量级，这里不做 --repeat：
       # “偶发失败”的重复验证仍由上面的 build-and-test 作业负责。
+      # setarch -R 关闭 ASLR：与上面的 sysctl 一起解决 TSan 启动崩溃。
       - name: Test
-        run: ctest --test-dir build/tsan --output-on-failure
+        run: |
+          if setarch "$(uname -m)" -R true 2>/dev/null; then
+            setarch "$(uname -m)" -R ctest --test-dir build/tsan --output-on-failure
+          else
+            ctest --test-dir build/tsan --output-on-failure
+          fi
+
+      - name: Publish failure details
+        if: failure()
+        run: |
+          {
+            echo '### ctest 失败详情'
+            echo '```'
+            sed -n '/The following tests FAILED/,$p' build/tsan/Testing/Temporary/LastTest.log | head -n 40 || true
+            echo '--- tail of LastTest.log ---'
+            tail -n 300 build/tsan/Testing/Temporary/LastTest.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
