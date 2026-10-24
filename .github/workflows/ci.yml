@@ -66,7 +66,8 @@ jobs:
     name: ubuntu / tsan
     runs-on: ubuntu-latest
     env:
-      TSAN_OPTIONS: halt_on_error=1 history_size=7 second_deadlock_stack=1
+      # halt_on_error=0：一次跑完，把所有竞争都报出来，而不是只报第一个。
+      TSAN_OPTIONS: halt_on_error=0 history_size=7 second_deadlock_stack=1
     steps:
       - uses: actions/checkout@v4
 
@@ -124,11 +125,20 @@ jobs:
       - name: Publish failure details
         if: failure()
         run: |
+          log=build/tsan/Testing/Temporary/LastTest.log
           {
             echo '### ctest 失败详情'
             echo '```'
-            sed -n '/The following tests FAILED/,$p' build/tsan/Testing/Temporary/LastTest.log | head -n 40 || true
-            echo '--- tail of LastTest.log ---'
-            tail -n 300 build/tsan/Testing/Temporary/LastTest.log || true
+            sed -n '/The following tests FAILED/,$p' "$log" | head -n 20 || true
+            echo '--- TSan 报告 ---'
+            grep -n -m3 -A12 'WARNING: ThreadSanitizer' "$log" || echo 'no TSan report found'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # 同时用 annotation 发一份：annotation 无需登录即可通过 API 读取。
+          if [ -f "$log" ]; then
+            msg=$(grep -m1 -A10 'WARNING: ThreadSanitizer' "$log" | tr -d '\r' | sed 's/|/\//g' | tr '\n' '~' | sed 's/~/ | /g' | cut -c1-900)
+            failed=$(sed -n '/The following tests FAILED/,$p' "$log" | head -n 3 | tr '\n' ' ')
+            echo "::error title=TSan race::${msg:-no report}"
+            echo "::error title=ctest failed::${failed:-unknown}"
+          fi
