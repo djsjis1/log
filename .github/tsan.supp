@@ -1,0 +1,17 @@
+# TSan 抑制清单
+#
+# deadlock:spdlog::details::backtracer::push_back
+#   spdlog 的 dump_backtrace() 会在持有本实例 backtracer 锁的情况下回调用户代码；
+#   如果用户的 log_callback 再往另一个实例写日志，就会去取对方的 backtracer 锁，
+#   于是出现 A.backtracer -> B.backtracer 与反向的加锁顺序，TSan 报
+#   lock-order-inversion。
+#
+#   本库在 Logger::dump_backtrace() 外面加了进程级递归锁 g_backtrace_dump_mutex，
+#   所有导出被串行化：同一时刻最多一个线程持有某实例的回溯锁并回调，
+#   因此两个方向不可能同时发生，不会真的死锁（tests 里的
+#   test_concurrent_backtrace_dump_with_cross_writes 就是这条路径的回归守卫）。
+#   TSan 的锁序检查不建模这层外层串行化，故在此抑制。
+#
+#   注意：普通 log 调用里的 push_back 只是短暂加锁、不回调用户代码，
+#   所以这条抑制不会掩盖其它真实竞争；data race 仍会照常报告。
+deadlock:spdlog::details::backtracer::push_back

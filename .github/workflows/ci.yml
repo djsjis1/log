@@ -67,7 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # halt_on_error=0：一次跑完，把所有竞争都报出来，而不是只报第一个。
-      TSAN_OPTIONS: halt_on_error=0 history_size=7 second_deadlock_stack=1
+      # suppressions 里记录了已知的 spdlog 回溯锁序假阳性（见 .github/tsan.supp）。
+      TSAN_OPTIONS: halt_on_error=0 history_size=7 second_deadlock_stack=1 suppressions=${{ github.workspace }}/.github/tsan.supp
     steps:
       - uses: actions/checkout@v4
 
