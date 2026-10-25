@@ -232,6 +232,8 @@ namespace mylog
         // 取底层的 spdlog 日志器，方便直接用 spdlog 原生 API（set_pattern、sinks() 等）。
         // 返回的 shared_ptr 会延长 sink（含文件句柄）的生命周期：不要跟到 shutdown() 之后，
         // 否则同一文件会一直被视为占用；实例不可用时返回 nullptr。
+        // 注意：不要绕过本层去调 native()->dump_backtrace()——多实例并发导出时，
+        // 底层会各自持回溯锁并互写对方日志，可能真死锁；导出请用 Logger::dump_backtrace()。
         std::shared_ptr<spdlog::logger> native() const;
 
         AsyncStats stats() const; // 同步模式下全为 0
