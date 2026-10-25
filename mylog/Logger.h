@@ -284,30 +284,46 @@ namespace mylog
 
         void release();
 
+        // 把配置装配进指定的 State（构造与重建共用）。成功时 st.init.ok 为 true。
+        bool build_into(State &st, const LogConfig &cfg);
+
+        // 在同一个对象上重建：先释放旧资源（归还文件租约），再装配新配置。
+        // 调用方必须保证此时没有线程在写日志（和 spdlog 换默认日志器同款约束）。
+        bool rebuild(const LogConfig &cfg);
+
         std::unique_ptr<State> state_;
         friend class SingletonLogger;
     };
 
     // 全局单例包装：不用自己持有 Logger，直接 LOGS_XXX(...) 就能写日志。
     // 正式使用前先调用 SingletonLogger::init(cfg)；忘记 init 也不会崩，日志被静默丢弃。
+    //
+    // 生命周期：首次 init 时创建**一个** Logger 对象，此后永不更换、永不销毁；
+    // init()/shutdown() 只重建/释放它的内部资源，对象地址不变。
+    // 因此 get() 返回的裸指针永远有效，热路径零额外开销（不再需要每次取快照）。
+    // 代价：和 spdlog 一样，init()/shutdown() 不能与写日志并发。
     class SingletonLogger
     {
     public:
-        // 推荐接口：返回一份持有所有权的快照，即使别的线程调用了 shutdown() 也不会悬空。
-        // 代价：每条 LOGS_* 要取一次快照（约 20~26ns，实测不随线程数放大）；
-        // 热循环可循环外取一次、循环内用 LOG_INFO(*snapshot, ...)，
-        // 但期间旧实例不回收，换配置对手里的快照也不生效。
-        static std::shared_ptr<Logger> acquire();
+        // 热路径入口：返回稳定的裸指针（未初始化 / 已 shutdown 时仍非空，只是写日志会被丢弃）。
+        // LOGS_* 宏用的就是它，每条日志只多一次普通指针读。
+        static Logger *get() noexcept;
 
-        // 初始化；失败时保留原有实例不变（失败原因可通过 init_checked 获取）。
-        // 同一日志文件仍被旧实例或旧快照占用时返回失败，需先 shutdown() 并释放全部快照。
+        // 旧名字，保留兼容：现在等价于 get()（对象常驻，不再需要持有快照）。
+        static Logger *acquire() noexcept;
+
+        // 初始化或重建。首次调用创建对象；之后在**同一个对象上原地重建**内部资源
+        // （可以换文件 / 轮转 / 异步开关），对象地址保持不变。
+        // 失败时单例回到未初始化状态（旧资源已释放），原因可通过 init_checked 获取。
+        // 不能与写日志并发调用。
         static bool init(const LogConfig &cfg = LogConfig{});
 
         // 同上，但返回 InitResult，能拿到失败分类和说明。
         static InitResult init_checked(const LogConfig &cfg = LogConfig{});
 
-        // 解除全局持有；若仍有 acquire() 快照存活，资源在最后一个快照释放时回收。
-        // 返回前会等待"转交给回收线程"的实例真正销毁，因此随后可以立刻重开同一文件。
+        // 关闭内部资源（flush、关文件、停线程）并归还文件占用，对象保留。
+        // 之后可以用同样的文件再次 init()；对象地址不变，因此 get() 的指针仍然有效。
+        // 不能与写日志并发调用。
         static void shutdown();
 
     private:
@@ -355,13 +371,13 @@ static_assert(MYLOG_ACTIVE_LEVEL >= MYLOG_LEVEL_TRACE && MYLOG_ACTIVE_LEVEL <= M
             _mylog_lg_.log(MYLOG_SRC_LOC, ::mylog::Level::LVL, __VA_ARGS__);          \
     } while (0)
 
-// 单例版：整个宏里只取一次快照，回调或并发 shutdown 都不会让它悬空。
+// 单例版：取一次稳定的裸指针（对象常驻，不存在悬空），再把工作交给实例宏。
 #define MYLOG_LOG_SINGLETON(LVL, ...)                                               \
     do                                                                              \
     {                                                                               \
-        auto _mylog_snapshot_ = ::mylog::SingletonLogger::acquire();                 \
-        if (_mylog_snapshot_)                                                        \
-            MYLOG_LOG_INSTANCE(*_mylog_snapshot_, LVL, __VA_ARGS__);                  \
+        auto *_mylog_lg_ = ::mylog::SingletonLogger::get();                          \
+        if (_mylog_lg_ && _mylog_lg_->should_process(::mylog::Level::LVL))           \
+            _mylog_lg_->log(MYLOG_SRC_LOC, ::mylog::Level::LVL, __VA_ARGS__);         \
     } while (0)
 
 // ---- 带实例参数的宏 ----

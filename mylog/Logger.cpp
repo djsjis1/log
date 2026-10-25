@@ -672,8 +672,17 @@ namespace mylog
     Logger::Logger(const LogConfig &cfg, DeferRegister)
         : state_(std::make_unique<State>())
     {
-        State &st = *state_;
+        build_into(*state_, cfg);
+    }
+
+    // 把配置装配进指定的 State：构造与"原地重建"共用同一段逻辑。
+    // 用 lambda 包住原来的提前返回，末尾统一用 st.init.ok 判定成败。
+    bool Logger::build_into(State &st, const LogConfig &cfg)
+    {
         const auto &handler = cfg.error_handler;
+
+        auto assemble = [&]()
+        {
 
         auto fail = [&](InitError code, const std::string &msg)
         {
@@ -1058,6 +1067,26 @@ namespace mylog
                     t_timer_state = nullptr;
                 });
         }
+        };
+        assemble();
+        return st.init.ok;
+    }
+
+    bool Logger::rebuild(const LogConfig &cfg)
+    {
+        // 先把旧资源还回去：同一个日志文件再次打开必须先释放租约，
+        // 否则会被判 "still in use"。所以重建失败时单例会回到未初始化状态。
+        release();
+
+        if (!state_)
+            state_ = std::make_unique<State>();
+
+        if (!build_into(*state_, cfg))
+            return false;
+
+        // 名字已在 release() 里注销，这里重新登记。
+        attach_registry();
+        return true;
     }
 
     Logger::Logger(Logger &&other) noexcept
@@ -1458,20 +1487,14 @@ namespace mylog
         // 声明在 g_singleton 之前：析构更晚，保证退出时先排空转交队列。
         ReaperGuard g_reaper_guard;
 
-        // 用原子读写代替全局锁：日志热路径不再争抢同一把互斥量，
-        // 同时保证 acquire() 拿到的 shared_ptr 快照是完整的。
+        // 单例对象只创建一次、永不更换、永不销毁：
+        // 所以热路径可以只持有裸指针，不需要快照。
+        // init()/shutdown() 只重建/释放它的内部资源，对象地址不变。
         std::shared_ptr<Logger> g_singleton;
-        std::mutex g_singleton_mutex; // 串行化"换指针 + 登记名字"
+        std::mutex g_singleton_mutex; // 串行化 init/shutdown 与首次创建
 
-        // 代际号：每次换/清空全局指针时 +1，用来让线程本地缓存失效。
-        // 必须先换指针再 +1（同一临界区内），否则读者可能把旧指针配上新代际号。
-        std::atomic<std::uint64_t> g_generation{0};
-
-        // 线程本地缓存：只存 weak_ptr，不延长任何寿命。
-        // 因此 shutdown() 仍能在最后一个快照释放后立刻回收文件占用；
-        // 快路径只是省掉一次全局的 shared_ptr 原子加载。
-        thread_local std::weak_ptr<Logger> t_cached_singleton;
-        thread_local std::uint64_t t_cached_generation = ~std::uint64_t{0};
+        // 热路径只读这一个原子指针；写入只在首次创建时发生一次。
+        std::atomic<Logger *> g_singleton_raw{nullptr};
 
         // init() 期间用户回调再调 init/shutdown 会重复获取 g_singleton_mutex，
         // 直接判为非法调用（返回失败），而不是挂住。
@@ -1513,16 +1536,14 @@ namespace mylog
         }
     }
 
-    std::shared_ptr<Logger> SingletonLogger::acquire()
+    Logger *SingletonLogger::get() noexcept
     {
-        const std::uint64_t generation = g_generation.load(std::memory_order_acquire);
-        if (generation == t_cached_generation)
-            return t_cached_singleton.lock(); // 快路径：只做一次引用计数
+        return g_singleton_raw.load(std::memory_order_acquire);
+    }
 
-        auto snapshot = std::atomic_load(&g_singleton);
-        t_cached_singleton = snapshot;
-        t_cached_generation = generation;
-        return snapshot;
+    Logger *SingletonLogger::acquire() noexcept
+    {
+        return get();
     }
 
     InitResult SingletonLogger::init_checked(const LogConfig &cfg)
@@ -1537,48 +1558,50 @@ namespace mylog
 
         ControlScope scope; // 覆盖构造 + 登记，回调里再调 init/shutdown 被拒绝
 
-        // 先等"在后台线程释放的最后一个快照"真正销毁：它可能还占着日志文件，
-        // 否则紧接着的同文件初始化会莫名报 "still in use"。
+        // 实例版日志器的延迟销毁可能还占着日志文件，先排空再开新文件。
         reaper_instance().drain();
 
-        // 构造在锁外：文件打开、目录创建、线程池启动都不能把日志调用者串行化。
-        // 注册延后到锁内，保证"全局指针"和"registry 里的名字"永远是同一个实例。
-        std::shared_ptr<Logger> candidate(new Logger(cfg, Logger::DeferRegister{}),
-                                         Logger::DeferredDeleter{});
-        if (!candidate->is_initialized())
-            return candidate->init_result(); // 失败时保留原有实例，不影响已在运行的服务
+        std::lock_guard<std::mutex> lock(g_singleton_mutex);
 
-        std::shared_ptr<Logger> previous;
+        if (!g_singleton)
         {
-            std::lock_guard<std::mutex> lock(g_singleton_mutex);
-            previous = std::atomic_exchange(&g_singleton, candidate);
+            // 首次：构造 + 注册都成功后才发布指针，失败什么都不留下。
+            std::shared_ptr<Logger> created(new Logger(cfg, Logger::DeferRegister{}),
+                                            Logger::DeferredDeleter{});
+            if (!created->is_initialized())
+                return created->init_result();
+
             try
             {
-                candidate->attach_registry();
+                created->attach_registry();
             }
             catch (const std::exception &ex)
             {
-                // 极端情况（同名注册与外部 spdlog 用户撞车）：回滚到旧实例。
-                std::atomic_store(&g_singleton, previous);
-                g_generation.fetch_add(1, std::memory_order_release);
-                InitResult result = candidate->init_result();
+                InitResult result = created->init_result();
                 result.ok = false;
                 result.degraded = false;
                 result.error = InitError::InvalidConfig;
                 result.message = std::string("[mylog] cannot register logger name: ") + ex.what();
-                report_error(candidate->state_->error_handler, result.message);
+                report_error(created->state_->error_handler, result.message);
                 return result;
             }
-            // 指针换完再 +1：读者只会看到"旧指针+旧代际号"或"新指针+新代际号"，
-            // 不会把旧指针配上新代际号（那会让线程本地缓存永久指向旧实例）。
-            g_generation.fetch_add(1, std::memory_order_release);
+
+            g_singleton = std::move(created);
+            // 对象地址从此固定不变，裸指针永远有效。
+            g_singleton_raw.store(g_singleton.get(), std::memory_order_release);
+            return g_singleton->init_result();
         }
 
-        // 锁外释放旧实例：若仍有 acquire() 快照存活，资源会延迟到最后一个
-        // 快照释放时回收；若那个释放发生在后台线程，由回收线程接手。
-        previous.reset();
-        reaper_instance().drain();
-        return candidate->init_result();
+        // 已有对象：在它身上原地重建（地址不变，get() 拿到的指针继续有效）。
+        if (g_singleton->is_on_background_thread())
+        {
+            InitResult guarded;
+            guarded.error = InitError::Unknown;
+            guarded.message = "[mylog] init() called from the logger's background thread; ignored";
+            return guarded;
+        }
+        g_singleton->rebuild(cfg);
+        return g_singleton->init_result();
     }
 
     bool SingletonLogger::init(const LogConfig &cfg)
@@ -1591,17 +1614,29 @@ namespace mylog
         if (t_in_singleton_control)
             return; // 从回调里调过来的，先让外层 init 跑完
 
-        std::shared_ptr<Logger> previous;
+        std::lock_guard<std::mutex> lock(g_singleton_mutex);
+        if (!g_singleton)
+            return;
+
+        // 在它自己的后台线程 / 用户回调里不能同步释放（会 join 自己）：
+        // 把释放转交回收线程，shutdown() 立刻返回。
+        if (g_singleton->is_on_background_thread() || !g_singleton->can_operate())
         {
-            std::lock_guard<std::mutex> lock(g_singleton_mutex);
-            previous = std::atomic_exchange(&g_singleton, std::shared_ptr<Logger>{});
-            // 同样：先清指针，再让线程本地缓存失效。
-            g_generation.fetch_add(1, std::memory_order_release);
+            std::shared_ptr<Logger> target = g_singleton;
+            try
+            {
+                reaper_instance().enqueue_task([target]() mutable { target->release(); });
+            }
+            catch (...)
+            {
+                std::fprintf(stderr, "[mylog] cannot defer singleton shutdown; skipped\n");
+            }
+            return;
         }
 
-        // 同 init_checked：不在锁内做资源回收，避免慢盘或线程 join 阻塞所有日志调用者。
-        previous.reset();
-        // 等"在后台线程释放的最后一个快照"真正销毁，随后可以立刻重开同一文件。
+        // 只释放内部资源（flush、关文件、停线程、注销名字），对象与裸指针保留：
+        // shutdown 之后写日志会被静默丢弃，但不会悬空。随后可以重新 init 同一文件。
+        g_singleton->release();
         reaper_instance().drain();
     }
 

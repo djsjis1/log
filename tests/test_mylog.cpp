@@ -407,7 +407,7 @@ namespace
         spdlog::drop("app");
         LOGS_INFO("this must be dropped silently");
         CHECK(spdlog::get("app") == nullptr);
-        CHECK(!SingletonLogger::acquire());
+        CHECK(SingletonLogger::get() == nullptr || !SingletonLogger::get()->is_initialized());
 
         auto probe = std::make_shared<Probe>();
         auto cfg = probe_config("uninitialized_then_init", probe);
@@ -416,8 +416,9 @@ namespace
         CHECK(spdlog::get(cfg.logger_name) != nullptr);
 
         SingletonLogger::shutdown();
-        // 关闭后：快照没了，名字也从 registry 里摘掉
-        CHECK(!SingletonLogger::acquire());
+        // 关闭后：对象仍存在（指针稳定），但内部资源已释放、名字也从 registry 摘掉
+        CHECK(SingletonLogger::get() != nullptr);
+        CHECK(!SingletonLogger::get()->is_initialized());
         CHECK(spdlog::get(cfg.logger_name) == nullptr);
     }
 
@@ -490,9 +491,8 @@ namespace
         CHECK(result.degraded);
         CHECK(notified);
 
-        auto logger = SingletonLogger::acquire();
+        auto *logger = SingletonLogger::acquire();
         CHECK(logger && logger->is_initialized());
-        logger.reset();
         SingletonLogger::shutdown();
     }
 
@@ -524,7 +524,8 @@ namespace
         CHECK(count_lines(dir / "drain.log") == static_cast<std::size_t>(kCount));
     }
 
-    void test_borrowed_snapshot()
+    // 单例对象常驻：shutdown() 只释放内部资源，指针始终有效，写日志被静默丢弃。
+    void test_pointer_stable_across_shutdown()
     {
         const fs::path dir = kBase / "snapshot";
         LogConfig cfg;
@@ -536,18 +537,24 @@ namespace
         cfg.pattern = "%v";
 
         CHECK(SingletonLogger::init(cfg));
+        Logger *logger = SingletonLogger::get();
+        CHECK(logger && logger->is_initialized());
+        LOGS_INFO("before-shutdown");
 
-        auto snapshot = SingletonLogger::acquire();
-        CHECK(snapshot && snapshot->is_initialized());
-
-        // 关闭全局持有后，快照仍然可用（生命周期由快照延长）
         SingletonLogger::shutdown();
-        CHECK(snapshot->is_initialized());
-        snapshot->log(MYLOG_SRC_LOC, Level::Info, "after global shutdown");
-        snapshot->flush();
-
-        snapshot.reset(); // 最后一个引用释放，此时才真正关闭并写盘
+        // 指针不变，但已经不可用：后续写入静默丢弃，不会悬空
+        CHECK(SingletonLogger::get() == logger);
+        CHECK(!logger->is_initialized());
+        logger->log(MYLOG_SRC_LOC, Level::Info, "after global shutdown");
+        logger->flush();
         CHECK(count_lines(dir / "snapshot.log") == 1);
+
+        // 同一文件可以重新初始化，指针仍是同一个
+        CHECK(SingletonLogger::init(cfg));
+        CHECK(SingletonLogger::get() == logger);
+        LOGS_INFO("after-reopen");
+        SingletonLogger::shutdown();
+        CHECK(count_lines(dir / "snapshot.log") == 2);
     }
 
     void test_overflow_discard()
@@ -570,13 +577,12 @@ namespace
         for (int i = 0; i < 20000; ++i)
             LOGS_INFO("overflow {}", i);
 
-        auto snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::acquire();
         CHECK(snapshot != nullptr);
         const AsyncStats stats = snapshot->stats();
         CHECK(stats.discard_count > 0);
 
         SingletonLogger::shutdown();
-        snapshot.reset();
     }
 
     void test_reinit_and_repeat_shutdown()
@@ -593,13 +599,10 @@ namespace
         CHECK(SingletonLogger::init(cfg));
         LOGS_INFO("first");
 
-        // 旧实例仍持有同一文件时，重新初始化必须被拒绝，
-        // 而不是并行开第二个轮转器
-        auto blocked = SingletonLogger::init_checked(cfg);
-        CHECK(!blocked.ok);
-        CHECK(blocked.error == InitError::FileSink);
-        CHECK(blocked.message.find("still in use") != std::string::npos);
-        LOGS_INFO("old instance still writable");
+        // 单例改成"原地重建"后，同一文件重复 init 等价于重启：
+        // 先归还租约再重新打开，内容只追加不截断。
+        CHECK(SingletonLogger::init(cfg));
+        LOGS_INFO("after-inplace-reinit");
 
         SingletonLogger::shutdown();
         SingletonLogger::shutdown(); // 重复关闭必须安全
@@ -614,7 +617,8 @@ namespace
         CHECK(count_lines(dir / "repeat.log") == 3);
     }
 
-    void test_same_file_held_by_snapshot()
+    // 同一个日志文件已被别的实例占着时，单例 init 必须被拒（进程级租约仍是唯一所有权）。
+    void test_same_file_held_by_instance()
     {
         const fs::path dir = kBase / "held";
         LogConfig cfg;
@@ -625,30 +629,24 @@ namespace
         cfg.log_file = "held.log";
         cfg.pattern = "%v";
 
-        CHECK(SingletonLogger::init(cfg));
-        LOGS_INFO("before-reinit");
-
-        auto snapshot = SingletonLogger::acquire();
-        CHECK(snapshot != nullptr);
-        SingletonLogger::shutdown(); // 只解除全局持有，快照仍占用文件
+        Logger holder(cfg);
+        CHECK(holder.is_initialized());
+        LOG_INFO(holder, "holder-line");
 
         auto blocked = SingletonLogger::init_checked(cfg);
         CHECK(!blocked.ok);
         CHECK(blocked.error == InitError::FileSink);
+        CHECK(blocked.message.find("still in use") != std::string::npos);
 
-        // 旧快照仍然可写，已有内容没有被截断
-        snapshot->log(MYLOG_SRC_LOC, Level::Info, "still alive");
-        snapshot->flush();
-        CHECK(count_lines(dir / "held.log") == 2);
-
-        snapshot.reset(); // 文件句柄在此关闭，占用归还
-
+        holder.shutdown();
         CHECK(SingletonLogger::init(cfg));
         LOGS_INFO("reopened");
         SingletonLogger::shutdown();
-        CHECK(count_lines(dir / "held.log") == 3);
+        CHECK(count_lines(dir / "held.log") == 2);
     }
 
+    // 同一个文件的多种写法（不同名字 / 相对路径 / 绝对路径 / 大小写）仍视为同一资源：
+    // 用两个实例验证（单例是原地重建，会先释放再重开，不参与这个竞态）。
     void test_same_file_aliases()
     {
         const fs::path dir = kBase / "alias";
@@ -658,24 +656,28 @@ namespace
         first.enable_file = true;
         first.log_dir = dir.string();
         first.log_file = "alias.log";
-        CHECK(SingletonLogger::init(first));
+        Logger owner(first);
+        CHECK(owner.is_initialized());
 
-        // 不同实例名、不同写法指向同一个文件时，必须一样被拒绝
+        auto rejected = [&](LogConfig other)
+        {
+            Logger second(other);
+            return !second.is_initialized();
+        };
+
         LogConfig other_name = first;
         other_name.logger_name = "alias_b";
-        auto r1 = SingletonLogger::init_checked(other_name);
-        CHECK(!r1.ok);
-        CHECK(r1.error == InitError::FileSink);
+        CHECK(rejected(other_name));
 
         LogConfig dotted = first;
         dotted.logger_name = "alias_c";
         dotted.log_dir = (kBase / "." / "alias" / ".." / "alias").string();
-        CHECK(!SingletonLogger::init_checked(dotted).ok);
+        CHECK(rejected(dotted));
 
         LogConfig absolute = first;
         absolute.logger_name = "alias_d";
         absolute.log_dir = fs::absolute(dir).string();
-        CHECK(!SingletonLogger::init_checked(absolute).ok);
+        CHECK(rejected(absolute));
 
 #ifdef _WIN32
         LogConfig upper = first;
@@ -684,14 +686,14 @@ namespace
         for (char &c : upper_dir)
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         upper.log_dir = upper_dir;
-        CHECK(!SingletonLogger::init_checked(upper).ok);
+        CHECK(rejected(upper));
 #endif
 
-        SingletonLogger::shutdown();
+        owner.shutdown();
 
-        // 释放后可以重新占用
-        CHECK(SingletonLogger::init(other_name));
-        SingletonLogger::shutdown();
+        // 释放后同一个文件可以重新占用
+        Logger again(other_name);
+        CHECK(again.is_initialized());
     }
 
     void test_concurrent_same_file_init()
@@ -804,7 +806,6 @@ namespace
         // 不需要 sleep：closer 会卡在“join 消费线程”上，直到开闸且 A、B 都写完。
         probe->open_gate();
         closer.join();
-        snapshot.reset();
         SingletonLogger::shutdown();
 
         const auto messages = probe->taken_messages();
@@ -866,7 +867,6 @@ namespace
 
         probe->open_gate();
         SingletonLogger::shutdown(); // 关闭不应再额外丢
-        snapshot.reset();            // 最后一个引用释放时才真正排空并回收
         registered.reset();
 
         bool saw_b = false;
@@ -895,7 +895,7 @@ namespace
 
         CHECK(SingletonLogger::init(cfg));
 
-        auto snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::acquire();
         CHECK(snapshot != nullptr);
         CHECK(snapshot->level() == Level::Warn);
         CHECK(snapshot->should_log(Level::Error));
@@ -909,7 +909,6 @@ namespace
         snapshot->set_level(Level::Info);
         CHECK(snapshot->should_log(Level::Info));
 
-        snapshot.reset();
         SingletonLogger::shutdown();
     }
 
@@ -951,15 +950,16 @@ namespace
 
         CHECK(SingletonLogger::init(cfg));
 
-        auto snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::acquire();
         CHECK(snapshot != nullptr);
         CHECK(!snapshot->is_on_background_thread());
 
-        snapshot.reset();
         SingletonLogger::shutdown();
     }
 
-    void test_concurrent_log_and_shutdown()
+    // 写作线程与 init/shutdown 并发在常驻单例模型下属于未定义行为（与 spdlog 同款约束），
+    // 因此这里只验证“先停写、再切换”的常规重建路径。
+    void test_reinit_under_quiet_period()
     {
         const fs::path dir = kBase / "race";
 
@@ -976,32 +976,16 @@ namespace
         };
 
         CHECK(SingletonLogger::init(make_config(0)));
+        LOGS_INFO("round 0");
 
-        std::atomic<bool> stop{false};
-        std::vector<std::thread> writers;
-        for (int i = 0; i < 4; ++i)
+        for (int round = 1; round <= 5; ++round)
         {
-            writers.emplace_back([&stop, i]
-                                 {
-                                     while (!stop.load(std::memory_order_relaxed))
-                                     {
-                                         LOGS_INFO("race {} {}", i, 0);
-                                         std::this_thread::sleep_for(std::chrono::microseconds(50));
-                                     }
-                                 });
+            CHECK(SingletonLogger::init(make_config(round))); // 原地重建，指针不变
+            LOGS_INFO("round {}", round);
         }
 
-        // 日志线程正在写的同时反复切换单例：快照必须保证不会悬空
-        for (int round = 1; round <= 30; ++round)
-        {
-            SingletonLogger::shutdown();
-            CHECK(SingletonLogger::init(make_config(round)));
-        }
-
-        stop = true;
-        for (auto &writer : writers)
-            writer.join();
         SingletonLogger::shutdown();
+        CHECK(count_lines(dir / "race5.log") == 1);
     }
 
     void test_failed_init_releases_file()
@@ -1049,10 +1033,8 @@ namespace
         CHECK(SingletonLogger::init(cfg));
         LOGS_INFO("daily line");
 
-        // 按天轮转同样遵守同一基础路径占用规则
-        auto blocked = SingletonLogger::init_checked(cfg);
-        CHECK(!blocked.ok);
-        CHECK(blocked.error == InitError::FileSink);
+        // 单例原地重建：同一路径再次 init 会先释放租约再重开，不再报 still in use
+        CHECK(SingletonLogger::init(cfg));
 
         SingletonLogger::shutdown();
 
@@ -1746,15 +1728,15 @@ namespace
         std::atomic<bool> correct{false};
         auto close_from_background = [&]
         {
-            // 持有一份快照：释放点就在后台线程的栈上，最后一个引用也在这里归零。
-            auto snapshot = SingletonLogger::acquire();
+            // 在后台线程上取一次指针：只验证“在该线程上调 shutdown 被拒绝”
+            auto *snapshot = SingletonLogger::acquire();
             if (!snapshot || acted.exchange(true))
                 return;
             correct = snapshot->is_on_background_thread();
             snapshot->shutdown(); // 必须拒绝自关闭
             if (!snapshot->is_initialized())
                 correct = false;
-            SingletonLogger::shutdown(); // 实际回收由独立线程执行
+            SingletonLogger::shutdown(); // 转交回收线程执行
         };
         if (timer)
         {
@@ -1772,8 +1754,9 @@ namespace
             LOGS_INFO("self-close");
         CHECK(probe->wait_destroyed());
         CHECK(acted && correct);
-        CHECK(!SingletonLogger::acquire());
-        SingletonLogger::shutdown();
+        SingletonLogger::shutdown(); // 排空转交的释放
+        CHECK(SingletonLogger::get() != nullptr);
+        CHECK(!SingletonLogger::get()->is_initialized());
     }
 
     void test_new_empty_and_failure_paths()
@@ -1866,30 +1849,26 @@ namespace
         CHECK(notifications == 800);
     }
 
-    void test_periodic_snapshot_and_failed_reinit()
+    // 重建失败后单例回到未初始化状态（对象仍在）：不崩溃、不残留旧 sink。
+    void test_failed_reinit_leaves_empty()
     {
         auto probe = std::make_shared<Probe>();
         auto cfg = probe_config("periodic_snapshot", probe);
         cfg.flush_interval = std::chrono::milliseconds(20);
-        cfg.async = true;
         CHECK(SingletonLogger::init(cfg));
-        auto snapshot = SingletonLogger::acquire();
+
         auto failed_cfg = cfg;
         failed_cfg.logger_name = "failed_reinit";
         failed_cfg.extra_sinks[0].factory = []() -> std::unique_ptr<spdlog::sinks::sink>
         { throw std::runtime_error("expected reinit failure"); };
         CHECK(!SingletonLogger::init_checked(failed_cfg));
-        CHECK(SingletonLogger::acquire() == snapshot);
-        LOGS_INFO("still-original");
-        SingletonLogger::shutdown();
-        CHECK(probe->wait_flush());
-        {
-            std::lock_guard<std::mutex> lock(probe->mutex);
-            CHECK(probe->destroyed == 0);
-        }
-        snapshot.reset();
-        CHECK(probe->destroyed == 1);
-        CHECK(probe->messages == std::vector<std::string>({"still-original"}));
+
+        // 旧资源已释放：对象还在，但已经不可用
+        CHECK(SingletonLogger::get() != nullptr);
+        CHECK(!SingletonLogger::get()->is_initialized());
+        LOGS_INFO("dropped silently");
+
+        SingletonLogger::shutdown(); // 幂等
     }
 
     void test_explicit_console_fallback_with_extra()
@@ -2024,9 +2003,8 @@ namespace
         CHECK(events.back() == "f");
     }
 
-    // 定时刷新的错误回调在定时线程上运行，它可能就是最后一个快照的释放点。
-    // 修复前：后台线程上的析构只能“泄漏状态保命”，定时器不停、文件占用不归还。
-    void test_last_snapshot_released_on_timer_thread()
+    // 定时刷新的 error_handler 运行在调度线程上；它调用 shutdown() 不能自锁。
+    void test_shutdown_from_timer_error_handler()
     {
         const fs::path dir = kBase / "timer_release";
         auto probe = std::make_shared<Probe>();
@@ -2036,33 +2014,28 @@ namespace
         cfg.log_dir = dir.string();
         cfg.log_file = "timer.log";
         cfg.flush_interval = std::chrono::milliseconds(20);
-        probe->throw_flush = true; // 每次刷新都失败，从而在定时线程上进入 error_handler
+        probe->throw_flush = true; // 每次刷新都失败，从而在调度线程上进入 error_handler
 
         std::atomic<bool> handled{false};
         cfg.error_handler = [&](const std::string &)
         {
-            auto snapshot = SingletonLogger::acquire();
-            if (!snapshot)
-                return; // 初始化还没完成，等下一次刷新
             if (handled.exchange(true))
                 return;
-            SingletonLogger::shutdown(); // 只解除全局引用，快照仍是最新一份
-            // snapshot 在定时线程的栈上析构：最后一个引用在后台线程释放
+            SingletonLogger::shutdown(); // 从调度线程发起：必须被安全处理
         };
 
         CHECK(SingletonLogger::init(cfg));
-        CHECK(probe->wait_destroyed()); // 修复前：泄漏导致 sink 永不销毁，超时失败
+        CHECK(probe->wait_destroyed());
         CHECK(handled.load());
-        CHECK(!SingletonLogger::acquire());
 
-        // 资源真的回收了：同一文件可以重新打开（修复前会被 "still in use" 拒绝）
+        // 资源已归还：同一文件可以立刻重新初始化（指针不变）
         probe->throw_flush = false;
         auto reopened = cfg;
         reopened.logger_name = "timer_release_again";
         reopened.flush_interval = std::chrono::milliseconds(0);
         reopened.error_handler = nullptr;
         CHECK(SingletonLogger::init(reopened));
-        LOGS_INFO("reopened after timer release");
+        LOGS_INFO("reopened after timer shutdown");
         SingletonLogger::shutdown();
     }
 
@@ -2141,9 +2114,9 @@ namespace
         CHECK(saw_b);
     }
 
-    // 最后一个快照在后台线程释放后，shutdown() 返回时资源必须已经回收，
-    // 随后可以立刻重开同一文件（修复前销毁被 detach 出去，这里会拿到旧占用）。
-    void test_background_release_finishes_before_shutdown_returns()
+    // 在自己的后台线程上关闭：只能转交回收线程，shutdown 返回后仍需下一次
+    // init/shutdown 把回收排空，随后可以立刻重开同一文件。
+    void test_shutdown_from_worker_error_handler()
     {
         const fs::path dir = kBase / "bg_release";
         auto probe = std::make_shared<Probe>();
@@ -2161,16 +2134,13 @@ namespace
         bool released_on_background = false;
         cfg.error_handler = [&](const std::string &)
         {
-            auto snapshot = SingletonLogger::acquire();
-            if (!snapshot)
-                return;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (released_on_background)
                     return;
             }
-            SingletonLogger::shutdown(); // 后台线程上解除全局持有
-            snapshot.reset();            // 最后一个引用也在这里归零
+            // 在消费线程上发起关闭：必须转交回收线程，不能同步 join 自己
+            SingletonLogger::shutdown();
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 released_on_background = true;
@@ -2231,14 +2201,13 @@ namespace
             for (auto &thread : threads)
                 thread.join();
 
-            auto snapshot = SingletonLogger::acquire();
+            auto *snapshot = SingletonLogger::acquire();
             CHECK(snapshot != nullptr);
             CHECK(spdlog::get("same_name") != nullptr);
 
             // 关闭时封装会用 get(name) 与自己的内部日志器做身份比对；若两者已经分叉
             // （初始化把注册和换指针拆到两个临界区），这里就会留下一个永久的残留项。
             SingletonLogger::shutdown();
-            snapshot.reset();
             CHECK(spdlog::get("same_name") == nullptr);
         }
     }
@@ -2417,9 +2386,9 @@ namespace
         sp.reset();
     }
 
-    // 线程本地快照缓存：反复写日志让缓存热起来后，shutdown() 仍能立刻归还文件。
-    // （缓存只存 weak_ptr；如果缓存强引用，下面第二次 init 会报 still in use）
-    void test_singleton_snapshot_cache()
+    // 反复写日志后 shutdown() 仍能立刻归还文件，同一文件可以马上重开；
+    // 关闭后的调用静默丢弃。
+    void test_reopen_same_file_after_shutdown()
     {
         const fs::path dir = kBase / "snapshot_cache";
         LogConfig cfg;
@@ -2469,7 +2438,7 @@ int main(int argc, char **argv)
     test_nested_callbacks_and_backtrace();
     test_concurrent_backtrace_dump_with_cross_writes();
     test_async_close_final_flush_order();
-    test_last_snapshot_released_on_timer_thread();
+    test_shutdown_from_timer_error_handler();
     test_discarded_messages_have_no_callback();
     test_periodic_flush(false);
     test_periodic_flush(true);
@@ -2484,17 +2453,17 @@ int main(int argc, char **argv)
     test_late_init_failure_cleanup(true);
     test_callback_concurrency(false);
     test_callback_concurrency(true);
-    test_periodic_snapshot_and_failed_reinit();
+    test_failed_reinit_leaves_empty();
     test_explicit_console_fallback_with_extra();
     test_uninitialized_is_silent();
     test_init_failure_callback_reentry();
     test_directory_failure();
     test_file_sink_fallback();
     test_async_drain();
-    test_borrowed_snapshot();
+    test_pointer_stable_across_shutdown();
     test_overflow_discard();
     test_reinit_and_repeat_shutdown();
-    test_same_file_held_by_snapshot();
+    test_same_file_held_by_instance();
     test_same_file_aliases();
     test_concurrent_same_file_init();
     test_size_rotation();
@@ -2506,20 +2475,20 @@ int main(int argc, char **argv)
     test_close_does_not_overwrite_queued_log(OverflowPolicy::OverrunOldest, "close_overrun", true);
     test_close_does_not_overwrite_queued_log(OverflowPolicy::DiscardNew, "close_discard", true);
     test_normal_overrun_still_drops_oldest();
-    test_concurrent_log_and_shutdown();
+    test_reinit_under_quiet_period();
     test_daily_rotation();
 
     // 本轮审计新增的回归用例
     test_macro_does_not_evaluate_when_filtered();
     test_flush_does_not_drop_queued_log();
-    test_background_release_finishes_before_shutdown_returns();
+    test_shutdown_from_worker_error_handler();
     test_concurrent_same_name_init_consistency();
     test_state_after_shutdown();
     test_invalid_level_is_rejected();
     test_move_assignment();
     test_flush_and_wait();
     test_native_handle();
-    test_singleton_snapshot_cache();
+    test_reopen_same_file_after_shutdown();
 
     fs::remove_all(kBase, ec);
 

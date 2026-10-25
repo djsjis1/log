@@ -315,9 +315,9 @@ int main()
         do_business_with_singleton(7);
         do_business_with_singleton(-1);
 
-        // shutdown() 只解除全局持有；若某线程还持有 acquire() 快照，
-        // 那段资源会到最后一个快照释放时才回收，期间同一日志文件仍被占用，
-        // 想用同一个文件重新 init() 需要等全部快照释放。
+        // 单例对象进程内常驻：shutdown() 只释放内部资源（flush、关文件、停线程），
+        // 对象和 SingletonLogger::get() 拿到的指针都一直有效；
+        // shutdown 之后写日志会被静默丢弃，随时可以再用同一文件 init()。
         mylog::SingletonLogger::shutdown();
     }
 
