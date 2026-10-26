@@ -57,6 +57,10 @@ static int test_compile_levels()
     if (!logger.is_initialized() || !SingletonLogger::init(cfg))
         return 1;
     auto evaluated = [&]() -> Logger & { ++instance_evaluations; return logger; };
+    // 裁剪档（如 MYLOG_ACTIVE_LEVEL=OFF）下所有 LOG_ 宏都不展开，lambda 一次也不会被调用；
+    // 显式标注并读取一次，避免 gcc/clang 的 unused 告警（不影响"参数不被求值"的测试语义）。
+    [[maybe_unused]] const auto &evaluated_ref = evaluated;
+    (void)evaluated_ref;
     LOG_TRACE(evaluated(), "{}", ++arguments[0]);
     LOG_DEBUG(evaluated(), "{}", ++arguments[1]);
     LOG_INFO(evaluated(), "{}", ++arguments[2]);
@@ -1068,7 +1072,9 @@ namespace
             freopen_s(&redirected, file.string().c_str(), "w", stdout);
 #else
             saved_ = dup(fileno(stdout));
-            (void)std::freopen(file.string().c_str(), "w", stdout);
+            // freopen 带 warn_unused_result 属性，gcc 下 (void) 强转压不住，放进 if 才算用到
+            if (!std::freopen(file.string().c_str(), "w", stdout))
+                std::fprintf(stderr, "[mylog] stdout redirect failed\n");
 #endif
         }
         ~stdout_redirect() { restore(); }

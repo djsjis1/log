@@ -17,10 +17,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        # -Werror 目前只在 MSVC 上验证过（本地 /W4 零告警）；gcc/clang 待验证后再打开。
+        # 三个编译器的库与测试均已零告警（各作业日志核验过），全部 -Werror 守住不倒退。
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DMYLOG_WERROR=${{ runner.os == 'Windows' && 'ON' || 'OFF' }}
+          -DMYLOG_WERROR=ON
 
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMYLOG_WERROR=ON
 
       - name: Build
         run: cmake --build build --parallel
@@ -63,6 +63,7 @@ jobs:
           cmake -S . -B build/asan
           -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DMYLOG_WERROR=ON
 
       - name: Build
         run: cmake --build build/asan --parallel
@@ -107,6 +108,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
           -DMYLOG_TEST_TIMEOUT=1500
           -DMYLOG_PROBE_TIMEOUT=300
+          -DMYLOG_WERROR=ON
 
       - name: Build
         run: cmake --build build/tsan --parallel
