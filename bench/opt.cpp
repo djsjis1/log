@@ -130,14 +130,14 @@ int main()
         const double t_single = best_of(kRounds, [&] { for (std::size_t i = 0; i < kN; ++i) LOGS_INFO("hello {}", i); });
         const double t_hoist = best_of(kRounds, [&]
                                        {
-                                           auto lg = mylog::SingletonLogger::acquire();
+                                           auto lg = mylog::SingletonLogger::get();
                                            if (lg)
                                                for (std::size_t i = 0; i < kN; ++i)
                                                    LOG_INFO(*lg, "hello {}", i);
                                        });
         const double t_inst = best_of(kRounds, [&] { for (std::size_t i = 0; i < kN; ++i) LOG_INFO(inst, "hello {}", i); });
         line("LOGS_INFO（每条取快照）", t_single, t_single);
-        line("acquire 一次 + LOG_INFO 循环", t_hoist, t_single);
+        line("get 一次 + LOG_INFO 循环", t_hoist, t_single);
         line("纯实例 LOG_INFO（参照）", t_inst, t_single);
         mylog::SingletonLogger::shutdown();
         inst.shutdown();

@@ -101,12 +101,12 @@ int main()
     }
     std::printf("   %+7.1f%%\n", (s8 / s1 - 1.0) * 100.0);
 
-    std::printf("%-26s", "hoisted (acquire once)");
+    std::printf("%-26s", "hoisted (get once)");
     for (int t : kThreadCounts)
     {
         const double v = best(t, [&]
                               {
-                                  auto lg = mylog::SingletonLogger::acquire();
+                                  auto lg = mylog::SingletonLogger::get();
                                   if (!lg)
                                       return;
                                   for (std::size_t i = 0; i < kPerThread; ++i)

@@ -1543,11 +1543,6 @@ namespace mylog
         return g_singleton_raw.load(std::memory_order_acquire);
     }
 
-    Logger *SingletonLogger::acquire() noexcept
-    {
-        return get();
-    }
-
     InitResult SingletonLogger::init_checked(const LogConfig &cfg)
     {
         InitResult refused;
