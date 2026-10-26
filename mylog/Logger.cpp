@@ -436,7 +436,9 @@ namespace mylog
 
             key = canonical.string();
 #ifdef _WIN32
-            // Windows 文件系统通常大小写不敏感，统一小写以免大小写别名绕过占用检查
+            // Windows 文件系统通常大小写不敏感，统一小写以免大小写别名绕过占用检查。
+            // 已知局限：这里只折叠 ASCII；非 ASCII 字符（如西里尔字母）不做 Unicode
+            // 大小写折叠，理论上可用这类别名绕过占用检查（常见日志文件名不受影响）。
             for (char &c : key)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 #endif

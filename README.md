@@ -66,6 +66,27 @@ cfg.log_file = "app.log";
 
 自定义 sink 若要写文件，必须在 `SinkConfig::file_paths` 里申报路径，否则这个保护看不到它。
 
+## JSON 输出（可选组件）
+
+`mylog/JsonFormatter.h` 把每条日志格式化成单行 JSON（JSON Lines）。纯头文件组件，
+谁 include 谁才编译，不用它的工程不为它付出任何编译成本：
+
+```cpp
+#include "JsonFormatter.h"
+logger.set_formatter(std::make_unique<mylog::JsonFormatter>());
+```
+
+- 一条日志一行：引号、反斜杠、换行、制表符及控制字符都会被转义，可直接按行交给采集端解析；
+- `JsonFormatter(false)` 省略 `src` 字段（不想在日志里暴露源码路径时用）；
+- `ts` 为本地时间毫秒精度，中文按 UTF-8 原样输出（前提是日志内容本身是 UTF-8）；
+- `set_formatter` 作用于该日志器的**全部**目标。想要"控制台普通格式、文件 JSON"，按 sink 单独设置：
+
+```cpp
+auto native = logger.native();
+if (native && native->sinks().size() > 1)
+    native->sinks()[1]->set_formatter(std::make_unique<mylog::JsonFormatter>());
+```
+
 ## 性能
 
 ### 调优先看配置，再看用法，最后才是库本身
@@ -114,12 +135,11 @@ median ratio (LOGS_* / LOG_INFO) = 0.949     ← 噪声内，等同
 ### 测量口径与可信度
 
 - 进程绑核（单线程档固定一个核，多线程档固定 4 个核）、每档跑 5 轮取最快、跨轮再取最小。
+- 基准程序已入库（`bench/` 目录，5 个程序与上文各项数据一一对应，默认不构建）：
+  `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMYLOG_BUILD_BENCH=ON`，
+  然后 `cmake --build build --config Release`。绑核仅 Windows 生效，其他平台只看比值。
 - Windows 上抖动很大：同一份代码单轮可相差 30%~300%，**绝对值只适合判断量级，横向结论看"比值"**。
 - "文件 sink + 异步 + 1 线程"这一档在负载机上无法比较（耗时由队列反压与磁盘决定），不要引用。
-- 基准程序未入库（在 `build/bench/`，已被 gitignore）。自行编译要点：
-  `cl /std:c++17 /EHsc /MD /O2 /DSPDLOG_COMPILED_LIB /I mylog /I mylog/spdlog-1.17.0/include ...`，
-  链接 `mylog.lib` 与 `spdlog.lib`；**必须定义 `SPDLOG_COMPILED_LIB`**，否则 spdlog 头会以
-  header-only 形式在 TU 内生成定义，与 `spdlog.lib` 撞重复符号。
 
 ## 已评估、暂不采用的优化
 
@@ -148,18 +168,21 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 也可以直接用预设：`cmake --preset release`、`cmake --build --preset release`、`ctest --preset release`
-（`asan` 预设用于 ASan/UBSan）。
+（`asan` 预设用于 ASan/UBSan；`tsan` 预设复现 CI 的 ThreadSanitizer 跑法，仅 Linux）。
 
-选项：`MYLOG_BUILD_EXAMPLE`、`MYLOG_BUILD_TESTS`（默认都开）。
+选项：`MYLOG_BUILD_EXAMPLE`、`MYLOG_BUILD_TESTS`（默认都开）、
+`MYLOG_BUILD_BENCH`（基准程序，默认关）、`MYLOG_WERROR`（告警当错误，默认关）。
 
 ## 目录
 
 | 路径 | 说明 |
 |---|---|
 | `mylog/Logger.h`、`mylog/Logger.cpp` | 封装层，唯一需要阅读的业务代码 |
+| `mylog/JsonFormatter.h` | 可选的 JSON Lines 格式器（纯头文件） |
 | `mylog/spdlog-1.17.0/` | 第三方源码（vendored，不修改） |
 | `tests/test_mylog.cpp` | 回归测试，CTest 驱动 |
 | `example.cpp` | 用法演示与多线程压测 |
+| `bench/` | 基准程序（`MYLOG_BUILD_BENCH=ON` 时构建） |
 
 ## 许可
 

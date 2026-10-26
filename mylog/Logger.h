@@ -143,6 +143,8 @@ namespace mylog
 
         Level console_level = Level::Trace; // 总门槛 level 先过滤，之后各目标再独立过滤
         Level file_level = Level::Trace;
+        // 每个目标可独立覆盖格式（不设置则继承 pattern）；空字符串 = 静默该目标，
+        // 正文不再出现在该目标的输出里。
         std::optional<std::string> console_pattern;
         std::optional<std::string> file_pattern;
         std::size_t hourly_max_files = 24; // 仅 Hourly 生效，0=不删除，最大 65535
@@ -199,7 +201,8 @@ namespace mylog
         // 要绝对保证全部写完，仍然只有 shutdown()。
         bool flush_and_wait(std::chrono::milliseconds timeout);
 
-        // 对应目标未启用时不操作；后调用的格式设置覆盖之前的设置。
+        // 对应目标未启用时不操作；后调用的格式设置覆盖之前的设置；
+        // pattern 传空字符串 = 静默该目标。
         void set_console_level(Level lvl);
         void set_file_level(Level lvl);
         void set_console_pattern(const std::string &pattern);
@@ -310,6 +313,7 @@ namespace mylog
         static Logger *get() noexcept;
 
         // 旧名字，保留兼容：现在等价于 get()（对象常驻，不再需要持有快照）。
+        // 计划在下一个不兼容版本移除，新代码请用 get()。
         static Logger *acquire() noexcept;
 
         // 初始化或重建。首次调用创建对象；之后在**同一个对象上原地重建**内部资源
