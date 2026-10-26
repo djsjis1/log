@@ -13,6 +13,9 @@ if(NOT DEFINED PROJECT_NAME)
 endif()
 
 # ------------------ 依赖: spdlog ------------------
+# vendored spdlog 源码目录：升级版本时改这里（目录名本身也带版本号）。
+set(MYLOG_SPDLOG_SUBDIR "spdlog-1.17.0")
+
 # 如果外层已经引入 spdlog，则复用；否则自动引入本目录下的 spdlog 源码
 if(NOT TARGET spdlog::spdlog AND NOT TARGET spdlog)
     # 关闭 spdlog 自己的示例/测试，减少构建负担
@@ -22,7 +25,7 @@ if(NOT TARGET spdlog::spdlog AND NOT TARGET spdlog)
     set(SPDLOG_INSTALL       OFF CACHE BOOL "" FORCE)
 
     add_subdirectory(
-        ${CMAKE_CURRENT_SOURCE_DIR}/spdlog-1.17.0
+        ${CMAKE_CURRENT_SOURCE_DIR}/${MYLOG_SPDLOG_SUBDIR}
         ${CMAKE_CURRENT_BINARY_DIR}/spdlog-build
         EXCLUDE_FROM_ALL
     )
@@ -43,6 +46,15 @@ if(MSVC)
     target_compile_options(mylog PRIVATE /utf-8 /W4)
 else()
     target_compile_options(mylog PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# MYLOG_WERROR 由外层工程（或 CI）打开：库本体保持零告警不倒退。
+if(MYLOG_WERROR)
+    if(MSVC)
+        target_compile_options(mylog PRIVATE /WX)
+    else()
+        target_compile_options(mylog PRIVATE -Werror)
+    endif()
 endif()
 
 # 头文件搜索路径对下游可见

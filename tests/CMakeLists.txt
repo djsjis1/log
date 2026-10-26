@@ -3,13 +3,24 @@
 set(MYLOG_TEST_TIMEOUT 180 CACHE STRING "Timeout (seconds) for the full mylog_tests run")
 set(MYLOG_PROBE_TIMEOUT 30 CACHE STRING "Timeout (seconds) for the short probe runs")
 
+# MYLOG_WERROR 由顶层工程（或 CI）打开：测试代码与库本体同样保持零告警。
+if(MYLOG_WERROR)
+    if(MSVC)
+        set(MYLOG_WERROR_OPTIONS /WX)
+    else()
+        set(MYLOG_WERROR_OPTIONS -Werror)
+    endif()
+else()
+    set(MYLOG_WERROR_OPTIONS)
+endif()
+
 add_executable(mylog_tests test_mylog.cpp)
 target_link_libraries(mylog_tests PRIVATE mylog::mylog)
 
 if(MSVC)
-    target_compile_options(mylog_tests PRIVATE /W4)
+    target_compile_options(mylog_tests PRIVATE /W4 ${MYLOG_WERROR_OPTIONS})
 else()
-    target_compile_options(mylog_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(mylog_tests PRIVATE -Wall -Wextra -Wpedantic ${MYLOG_WERROR_OPTIONS})
 endif()
 
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
@@ -41,9 +52,9 @@ foreach(level IN ITEMS INFO OFF)
         MYLOG_ACTIVE_LEVEL=MYLOG_LEVEL_${level}
     )
     if(MSVC)
-        target_compile_options(${test_target} PRIVATE /W4)
+        target_compile_options(${test_target} PRIVATE /W4 ${MYLOG_WERROR_OPTIONS})
     else()
-        target_compile_options(${test_target} PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(${test_target} PRIVATE -Wall -Wextra -Wpedantic ${MYLOG_WERROR_OPTIONS})
     endif()
 
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${suffix}")

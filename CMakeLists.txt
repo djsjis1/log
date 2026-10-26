@@ -13,6 +13,9 @@ project(mylog CXX)
 # ------------------ 选项 ------------------
 option(MYLOG_BUILD_EXAMPLE "Build mylog example" ON)
 option(MYLOG_BUILD_TESTS "Build mylog tests" ON)
+option(MYLOG_BUILD_BENCH "Build benchmarks in bench/ (README 性能数据的来源)" OFF)
+# 把告警当错误，守住“零告警”不倒退。由使用方/CI 决定是否开启。
+option(MYLOG_WERROR "Treat compiler warnings as errors (mylog/example/tests/bench)" OFF)
 
 # ------------------ 库 ------------------
 add_subdirectory(mylog)
@@ -26,6 +29,18 @@ if(MYLOG_BUILD_EXAMPLE)
     else()
         target_compile_options(mylog_example PRIVATE -Wall -Wextra)
     endif()
+    if(MYLOG_WERROR)
+        if(MSVC)
+            target_compile_options(mylog_example PRIVATE /WX)
+        else()
+            target_compile_options(mylog_example PRIVATE -Werror)
+        endif()
+    endif()
+endif()
+
+# ------------------ 基准 ------------------
+if(MYLOG_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()
 
 # ------------------ 测试 ------------------
