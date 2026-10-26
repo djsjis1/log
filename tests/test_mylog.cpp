@@ -1,7 +1,9 @@
 // mylog 回归测试：只依赖 C++17 标准库，用 CTest 驱动。
 // 覆盖初始化失败回调重入、单例生命周期、异步排空 / 溢出统计、
-// 降级与目录失败、重复初始化 / 关闭、移动语义、日轮转。
+// 降级与目录失败、重复初始化 / 关闭、移动语义、日轮转，
+// 以及 JsonFormatter 的单行契约与转义。
 #include "Logger.h"
+#include "JsonFormatter.h"
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/base_sink.h>
@@ -491,7 +493,7 @@ namespace
         CHECK(result.degraded);
         CHECK(notified);
 
-        auto *logger = SingletonLogger::acquire();
+        auto *logger = SingletonLogger::get();
         CHECK(logger && logger->is_initialized());
         SingletonLogger::shutdown();
     }
@@ -577,7 +579,7 @@ namespace
         for (int i = 0; i < 20000; ++i)
             LOGS_INFO("overflow {}", i);
 
-        auto *snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::get();
         CHECK(snapshot != nullptr);
         const AsyncStats stats = snapshot->stats();
         CHECK(stats.discard_count > 0);
@@ -787,7 +789,7 @@ namespace
         if (!registered)
             return;
 
-        auto snapshot = SingletonLogger::acquire();
+        auto snapshot = SingletonLogger::get();
         CHECK(snapshot != nullptr);
         if (!snapshot)
             return;
@@ -851,7 +853,7 @@ namespace
             return;
         }
 
-        auto snapshot = SingletonLogger::acquire();
+        auto snapshot = SingletonLogger::get();
         CHECK(snapshot != nullptr);
         if (!snapshot)
         {
@@ -895,7 +897,7 @@ namespace
 
         CHECK(SingletonLogger::init(cfg));
 
-        auto *snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::get();
         CHECK(snapshot != nullptr);
         CHECK(snapshot->level() == Level::Warn);
         CHECK(snapshot->should_log(Level::Error));
@@ -950,7 +952,7 @@ namespace
 
         CHECK(SingletonLogger::init(cfg));
 
-        auto *snapshot = SingletonLogger::acquire();
+        auto *snapshot = SingletonLogger::get();
         CHECK(snapshot != nullptr);
         CHECK(!snapshot->is_on_background_thread());
 
@@ -1729,7 +1731,7 @@ namespace
         auto close_from_background = [&]
         {
             // 在后台线程上取一次指针：只验证“在该线程上调 shutdown 被拒绝”
-            auto *snapshot = SingletonLogger::acquire();
+            auto *snapshot = SingletonLogger::get();
             if (!snapshot || acted.exchange(true))
                 return;
             correct = snapshot->is_on_background_thread();
@@ -2190,7 +2192,7 @@ namespace
             std::vector<std::thread> threads;
             for (int i = 0; i < 8; ++i)
             {
-                threads.emplace_back([&, i]
+                threads.emplace_back([&]
                                      {
                                          while (!start.load(std::memory_order_acquire))
                                              std::this_thread::yield();
@@ -2201,7 +2203,7 @@ namespace
             for (auto &thread : threads)
                 thread.join();
 
-            auto *snapshot = SingletonLogger::acquire();
+            auto *snapshot = SingletonLogger::get();
             CHECK(snapshot != nullptr);
             CHECK(spdlog::get("same_name") != nullptr);
 
@@ -2386,6 +2388,79 @@ namespace
         sp.reset();
     }
 
+    // JsonFormatter：单行 JSON 契约、转义、可选 src 字段、clone 独立性，
+    // 以及经 Logger 真实 sink 路径的端到端输出。
+    void test_json_formatter()
+    {
+        const std::string payload = "hello 42";
+        spdlog::details::log_msg msg(spdlog::source_loc{"f.cpp", 7, "fn"},
+                                     "json_logger", spdlog::level::info,
+                                     spdlog::string_view_t(payload.data(), payload.size()));
+
+        mylog::JsonFormatter fmt;
+        spdlog::memory_buf_t out;
+        fmt.format(msg, out);
+        const std::string text(out.data(), out.size());
+        CHECK(text.find("{\"ts\":\"") == 0);
+        CHECK(text.size() >= 2 && text.compare(text.size() - 2, 2, "}\n") == 0);
+        CHECK(text.find('\n') == text.size() - 1); // 一条日志恰好一行
+        CHECK(text.find("\"level\":\"info\"") != std::string::npos);
+        CHECK(text.find("\"logger\":\"json_logger\"") != std::string::npos);
+        CHECK(text.find("\"msg\":\"hello 42\"") != std::string::npos);
+        CHECK(text.find("\"src\":\"f.cpp:7\"") != std::string::npos);
+
+        // include_source=false：省略 src 字段
+        out.clear();
+        mylog::JsonFormatter(false).format(msg, out);
+        const std::string no_src(out.data(), out.size());
+        CHECK(no_src.find("\"src\"") == std::string::npos);
+        CHECK(no_src.find("\"msg\":\"hello 42\"") != std::string::npos);
+        CHECK(no_src.find('\n') == no_src.size() - 1);
+
+        // 转义：引号、反斜杠、换行、制表符、控制字符走 \u00XX；UTF-8 字节原样保留
+        const std::string tricky = std::string("a\"b\\c\nd\te") + char(1) + "\xE4\xB8\xAD";
+        spdlog::details::log_msg tricky_msg(spdlog::source_loc{}, "esc", spdlog::level::warn,
+                                            spdlog::string_view_t(tricky.data(), tricky.size()));
+        out.clear();
+        fmt.format(tricky_msg, out);
+        const std::string escaped(out.data(), out.size());
+        CHECK(escaped.find("\"msg\":\"a\\\"b\\\\c\\nd\\te\\u0001\xE4\xB8\xAD\"") != std::string::npos);
+        CHECK(escaped.find('\n') == escaped.size() - 1); // 正文里的换行必须已被转义
+
+        // clone()：独立对象，输出与原对象一致
+        const auto cloned = fmt.clone();
+        CHECK(cloned != nullptr);
+        out.clear();
+        cloned->format(msg, out);
+        CHECK(std::string(out.data(), out.size()) == text);
+
+        // 空 payload 仍是合法的一行
+        spdlog::details::log_msg empty_msg(spdlog::source_loc{}, "esc", spdlog::level::err, "");
+        out.clear();
+        fmt.format(empty_msg, out);
+        const std::string empty_out(out.data(), out.size());
+        CHECK(empty_out.find("\"msg\":\"\"") != std::string::npos);
+        CHECK(empty_out.find('\n') == empty_out.size() - 1);
+
+        // 端到端：经 Logger + 探针 sink，确认 set_formatter 在真实路径生效
+        auto probe = std::make_shared<Probe>();
+        auto cfg = probe_config("json_via_logger", probe);
+        Logger logger(cfg);
+        CHECK(logger.is_initialized());
+        logger.set_formatter(std::make_unique<mylog::JsonFormatter>(false));
+        LOG_INFO(logger, "via {}", "logger");
+        logger.flush();
+        CHECK(probe->formatted.size() == 1);
+        if (!probe->formatted.empty())
+        {
+            const std::string &line = probe->formatted.front();
+            CHECK(line.find("\"msg\":\"via logger\"") != std::string::npos);
+            CHECK(line.find("\"src\"") == std::string::npos);
+            CHECK(line.back() == '\n');
+        }
+        logger.shutdown();
+    }
+
     // 反复写日志后 shutdown() 仍能立刻归还文件，同一文件可以马上重开；
     // 关闭后的调用静默丢弃。
     void test_reopen_same_file_after_shutdown()
@@ -2488,6 +2563,7 @@ int main(int argc, char **argv)
     test_move_assignment();
     test_flush_and_wait();
     test_native_handle();
+    test_json_formatter();
     test_reopen_same_file_after_shutdown();
 
     fs::remove_all(kBase, ec);
