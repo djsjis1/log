@@ -1560,10 +1560,12 @@ namespace mylog
 
         ControlScope scope; // 覆盖构造 + 登记，回调里再调 init/shutdown 被拒绝
 
-        // 实例版日志器的延迟销毁可能还占着日志文件，先排空再开新文件。
-        reaper_instance().drain();
-
         std::lock_guard<std::mutex> lock(g_singleton_mutex);
+
+        // 排空之前转交给回收线程的销毁/释放。必须持锁后做：后台线程发起的
+        // shutdown 把 release() 排进了回收队列，若不先等它跑完，
+        // 下面的原地重建/释放就会与回收线程并发触碰同一份 State（TSan 实测）。
+        reaper_instance().drain();
 
         if (!g_singleton)
         {
@@ -1635,6 +1637,11 @@ namespace mylog
             }
             return;
         }
+
+        // 先等掉之前转交给回收线程的释放（后台线程发起的 shutdown 走的就是这条路），
+        // 否则它会与本线程下面的同步 release() 并发跑在同一份 State 上。
+        // 期间不可能再进新的转交：后台线程的 shutdown 也要拿这把锁。
+        reaper_instance().drain();
 
         // 只释放内部资源（flush、关文件、停线程、注销名字），对象与裸指针保留：
         // shutdown 之后写日志会被静默丢弃，但不会悬空。随后可以重新 init 同一文件。
